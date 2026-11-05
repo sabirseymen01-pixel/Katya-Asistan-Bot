@@ -9,17 +9,23 @@ SESSION_STRING = os.getenv("SESSION_STRING", "")
 
 user_client = None
 call_client = None
-AudioPipedClass = None
+StreamClass = None
 
 if SESSION_STRING and API_ID and API_HASH:
     try:
         from pytgcalls import PyTgCalls
+
+        # py-tgcalls 2.x için MediaStream, eski sürümler için AudioPiped uyumluluğu
         try:
-            from pytgcalls.types.input_stream import AudioPiped
-            AudioPipedClass = AudioPiped
+            from pytgcalls.types import MediaStream
+            StreamClass = MediaStream
         except Exception:
-            from pytgcalls.types import AudioPiped
-            AudioPipedClass = AudioPiped
+            try:
+                from pytgcalls.types.input_stream import AudioPiped
+                StreamClass = AudioPiped
+            except Exception:
+                from pytgcalls.types import AudioPiped
+                StreamClass = AudioPiped
 
         user_client = Client(
             "katya_assistant_user",
@@ -53,7 +59,7 @@ async def stop_voice_client():
 
 async def join_and_speak(chat_id: int, text: str):
     """Metni Türkçe kadın sesine çevirir ve sesli sohbete basar."""
-    if not call_client or not AudioPipedClass:
+    if not call_client or not StreamClass:
         return "Ses istemcisi aktif değil veya kütüphane uyumsuz."
 
     file_id = f"{abs(chat_id)}_{int(asyncio.get_event_loop().time())}"
@@ -63,12 +69,19 @@ async def join_and_speak(chat_id: int, text: str):
         communicate = edge_tts.Communicate(text, "tr-TR-EmelNeural")
         await communicate.save(temp_mp3)
 
-        audio_stream = AudioPipedClass(temp_mp3)
+        audio_stream = StreamClass(temp_mp3)
 
         try:
-            await call_client.join_group_call(chat_id, audio_stream)
+            # py-tgcalls 2.x API desteği: play veya join_group_call
+            if hasattr(call_client, "play"):
+                await call_client.play(chat_id, audio_stream)
+            else:
+                await call_client.join_group_call(chat_id, audio_stream)
         except Exception:
-            await call_client.change_stream(chat_id, audio_stream)
+            if hasattr(call_client, "change_stream"):
+                await call_client.change_stream(chat_id, audio_stream)
+            elif hasattr(call_client, "play"):
+                await call_client.play(chat_id, audio_stream)
 
         return None
     except Exception as e:
@@ -86,6 +99,9 @@ async def leave_voice(chat_id: int):
     """Sesli sohbetten ayrılır."""
     if call_client:
         try:
-            await call_client.leave_group_call(chat_id)
+            if hasattr(call_client, "leave_call"):
+                await call_client.leave_call(chat_id)
+            else:
+                await call_client.leave_group_call(chat_id)
         except Exception as e:
             print(f"[VOICE] Ayrılma hatası: {e}")
