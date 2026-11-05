@@ -62,7 +62,7 @@ if SESSION_STRING and API_ID and API_HASH:
             in_memory=True,
         )
         call_client = PyTgCalls(user_client)
-        log_event("SYS", "UserBot ve PyTgCalls nesnesi hazırlandı.")
+        log_event("SYS", "PyTgCalls ve UserBot hazırlandı.")
     except Exception as e:
         log_event("ERR", f"PyTgCalls başlatma hatası: {e}")
         call_client = None
@@ -92,6 +92,12 @@ async def speak_in_voice(chat_id: int, text: str):
     except Exception as e:
         log_event("ERR", f"Ses yayın hatası: {e}")
         return str(e)
+    finally:
+        if os.path.exists(mp3_file):
+            try:
+                os.remove(mp3_file)
+            except Exception:
+                pass
 
 # --- Telegram Bot Komutları ---
 
