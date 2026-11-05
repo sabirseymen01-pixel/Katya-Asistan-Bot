@@ -10,6 +10,7 @@ import uvicorn
 import edge_tts
 
 from pyrogram import Client
+from google import genai
 
 from telegram import Update
 from telegram.ext import (
@@ -25,8 +26,22 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 API_ID = int(os.getenv("API_ID", 0))
 API_HASH = os.getenv("API_HASH", "")
 SESSION_STRING = os.getenv("SESSION_STRING", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 KATYA_VOICE = "tr-TR-EmelNeural"
+KATYA_PROMPT = (
+    "Sen Katya'sın. Telegram'daki Golden grubunun akıllı, esprili ve yardımsever "
+    "canlı sesli asistanısın. Yanıtlarını konuşma diline uygun, doğal, çok uzun olmayan "
+    "akıcı Türkçe cümlelerle ver. Markdown veya liste işaretleri (*, #) kullanma, doğrudan seslendirilecek gibi konuş."
+)
+
+# Yapay Zeka İstemcisi
+ai_client = None
+if GEMINI_API_KEY:
+    try:
+        ai_client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"[AI] Gemini başlatma hatası: {e}")
 
 # Staff Paneli Havuzu
 MAX_LOGS = 150
@@ -42,7 +57,7 @@ def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
 
-# --- Ses Motoru (İzole, Çökmeyi Önler) ---
+# --- Ses Motoru (UserBot & PyTgCalls) ---
 
 user_client = None
 call_client = None
@@ -51,7 +66,7 @@ StreamClass = None
 async def init_voice_engine():
     global user_client, call_client, StreamClass
     if not (SESSION_STRING and API_ID and API_HASH):
-        log_event("SYS", "UserBot değişkenleri eksik, ses devre dışı.")
+        log_event("SYS", "HATA: SESSION_STRING, API_ID veya API_HASH eksik!")
         return
 
     try:
@@ -75,16 +90,33 @@ async def init_voice_engine():
             in_memory=True
         )
         call_client = PyTgCalls(user_client)
+        
         await user_client.start()
         await call_client.start()
-        log_event("SYS", "UserBot ve PyTgCalls aktif.")
+        log_event("SYS", "UserBot ve PyTgCalls ses motoru başarıyla bağlandı!")
     except Exception as e:
-        log_event("ERR", f"Ses motoru yükleme uyarısı: {e}")
+        log_event("ERR", f"Ses motoru bağlantı hatası: {e}")
         call_client = None
 
+async def generate_ai_response(prompt: str) -> str:
+    """Gemini API kullanarak Katya'nın seslendireceği yanıtı üretir."""
+    if not ai_client:
+        return "Yapay zeka anahtarım henüz ayarlanmamış, sadece yazdıklarınızı tekrar edebilirim."
+    try:
+        response = ai_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config={"system_instruction": KATYA_PROMPT}
+        )
+        return response.text.strip()
+    except Exception as e:
+        log_event("ERR", f"AI yanıt hatası: {e}")
+        return "Şu anda düşüncelerimi toparlayamadım, lütfen tekrar sorar mısın?"
+
 async def speak_in_voice(chat_id: int, text: str):
+    """Metni Türkçe kadın sesiyle sesli sohbete aktarır."""
     if not call_client or not StreamClass:
-        return "Ses istemcisi aktif değil veya kütüphane uyumsuz."
+        return "Ses istemcisi (UserBot) aktif değil. Render Environment değişkenlerini kontrol edin."
 
     file_id = f"{abs(chat_id)}_{int(asyncio.get_event_loop().time())}"
     temp_mp3 = f"voice_{file_id}.mp3"
@@ -108,13 +140,13 @@ async def speak_in_voice(chat_id: int, text: str):
 
         stats["in_voice_chat"] = True
         stats["voice_speaks"] += 1
-        log_event("VOICE", f"Sesli odada konuşuldu: '{text[:35]}...'")
+        log_event("VOICE", f"Katya konuştu: '{text[:40]}...'")
         return None
     except Exception as e:
-        log_event("ERR", f"Ses yayın hatası: {e}")
+        log_event("ERR", f"Ses aktarım hatası: {e}")
         return str(e)
     finally:
-        await asyncio.sleep(5)
+        await asyncio.sleep(6)
         if os.path.exists(temp_mp3):
             try:
                 os.remove(temp_mp3)
@@ -139,11 +171,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     log_event("CMD", f"/start - @{user.username or user.id}")
     await update.message.reply_text(
-        f"Merhaba {user.first_name}! Ben Katya Asistan.\n"
-        "Golden grubunu yönetmek ve sesli sohbete katılmak için buradayım.\n\n"
+        f"Merhaba {user.first_name}! Ben Yapay Zeka Asistanı Katya.\n"
+        "Golden grubunda canlı sesli sohbette sohbet etmek için hazırım.\n\n"
         "Komutlar:\n"
-        "• `/seskatil` - Sesli odaya bağlanır.\n"
-        "• `/konus <mesaj>` - Canlı sesli sohbette konuşur.\n"
+        "• `/seskatil` - Sesli sohbete katılır.\n"
+        "• `/sor <soru>` - Yapay zeka ile düşünüp sesli sohbette konuşur.\n"
+        "• `/konus <metin>` - Yazdığınız metni doğrudan seslendirir.\n"
         "• `/sesayril` - Sesli sohbetten çıkar."
     )
 
@@ -151,11 +184,34 @@ async def join_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     log_event("STAFF", f"Sesli odaya bağlanma istendi (Chat ID: {chat_id})")
     await update.message.reply_text("Sesli sohbete bağlanılıyor...")
-    err = await speak_in_voice(chat_id, "Golden grubu selamlar, Katya sesli sohbete katıldı!")
+    
+    greeting = "Selam Golden grubu! Ben Katya, sesli sohbete katıldım. Bana soru sormak için grupta eğik çizgi sor yazabilirsiniz."
+    err = await speak_in_voice(chat_id, greeting)
     if err:
         await update.message.reply_text(f"Bağlantı hatası: {err}")
     else:
-        await update.message.reply_text("Sesli sohbete bağlandım!")
+        await update.message.reply_text("Sesli sohbete bağlandım ve kendimi tanıttım!")
+
+async def ask_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Kullanıcının sorusunu Gemini'ye sorar ve cevabı sesli sohbette okur."""
+    if not context.args:
+        await update.message.reply_text("Lütfen sormak istediğin şeyi yaz: `/sor Golden grubu için motivasyon ver`")
+        return
+        
+    question = " ".join(context.args)
+    chat_id = update.effective_chat.id
+    user = update.effective_user
+    
+    wait_msg = await update.message.reply_text("Katya düşünüyor...")
+    
+    # 1. Yapay Zekadan Yanıt Al
+    ai_answer = await generate_ai_response(f"@{user.first_name} sordu: {question}")
+    await wait_msg.edit_text(f"Katya:\n\n{ai_answer}\n\n(Sesli sohbete aktarılıyor...)")
+    
+    # 2. Yanıtı Sesli Sohbete Bas
+    err = await speak_in_voice(chat_id, ai_answer)
+    if err:
+        await update.message.reply_text(f"Ses yayınlama uyarısı: {err}")
 
 async def speak_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -182,7 +238,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if "katya" in text.lower():
         log_event("KATYA", f"@{user.username or user.id}: {text[:30]}")
-        await update.message.reply_text("Golden grubu için dinlemedeyim!")
+        # Katya adı geçen mesajlara metin olarak AI cevabı döner
+        reply = await generate_ai_response(text)
+        await update.message.reply_text(reply)
     else:
         log_event("MSG", f"@{user.username or user.id}: {text[:25]}")
 
@@ -193,7 +251,7 @@ HTML_TEMPLATE = """
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
-    <title>Katya Staff Suite</title>
+    <title>Katya AI & Voice Suite</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <meta http-equiv="refresh" content="5">
     <style>
@@ -210,8 +268,8 @@ HTML_TEMPLATE = """
     <div class="container-fluid">
         <div class="d-flex justify-content-between align-items-center mb-3 pb-2 border-bottom border-secondary">
             <div>
-                <h4 class="mb-0 fw-bold">Katya Asistan <span class="badge bg-danger">Staff Panel</span></h4>
-                <small class="text-secondary">Golden Grubu Ses & Chat Yönetim Arayüzü</small>
+                <h4 class="mb-0 fw-bold">Katya AI Asistan <span class="badge bg-danger">Staff Panel</span></h4>
+                <small class="text-secondary">Golden Grubu Canlı Ses & Yapay Zeka Arayüzü</small>
             </div>
             <span class="badge bg-success px-3 py-2">Çevrimiçi</span>
         </div>
@@ -252,7 +310,7 @@ bot_app = None
 async def lifespan(app: FastAPI):
     global bot_app
     
-    # 1. Ses motorunu arka planda başlat (ana sunucuyu asla engellemez)
+    # 1. Ses motorunu arka planda başlat
     asyncio.create_task(init_voice_engine())
 
     # 2. Telegram Botunu Başlat
@@ -261,6 +319,7 @@ async def lifespan(app: FastAPI):
             bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
             bot_app.add_handler(CommandHandler("start", start_cmd))
             bot_app.add_handler(CommandHandler("seskatil", join_voice_cmd))
+            bot_app.add_handler(CommandHandler("sor", ask_ai_cmd))
             bot_app.add_handler(CommandHandler("konus", speak_cmd))
             bot_app.add_handler(CommandHandler("sesayril", leave_voice_cmd))
             bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
@@ -268,7 +327,7 @@ async def lifespan(app: FastAPI):
             await bot_app.initialize()
             await bot_app.start()
             await bot_app.updater.start_polling()
-            log_event("SYS", "Katya Bot dinlemede.")
+            log_event("SYS", "Katya Telegram bot ve AI dinlemede.")
         except Exception as e:
             log_event("ERR", f"Bot hatası: {e}")
 
