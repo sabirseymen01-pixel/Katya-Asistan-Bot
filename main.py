@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import uvicorn
 import edge_tts
+from gtts import gTTS
 
 from pyrogram import Client
 from google import genai
@@ -60,7 +61,6 @@ stats = {
 def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
-    # Render konsoluna da doğrudan bas
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 # --- Ses Motoru (UserBot & PyTgCalls) ---
@@ -72,7 +72,6 @@ StreamClass = None
 async def init_voice_engine():
     global user_client, call_client, StreamClass
     
-    # Detaylı Teşhis Kontrolü
     missing = []
     if not API_ID:
         missing.append("API_ID")
@@ -132,6 +131,19 @@ async def generate_ai_response(prompt: str) -> str:
         log_event("ERR", f"AI hatasi: {e}")
         return "Cevap olustururken bir aksaklik yasadim."
 
+async def text_to_speech(text: str, filename: str):
+    """Önce Microsoft Edge-TTS dener, 403 verirse anında Google TTS motoruna geçer."""
+    try:
+        communicate = edge_tts.Communicate(text, KATYA_VOICE)
+        await communicate.save(filename)
+    except Exception as e:
+        log_event("SYS", f"Edge-TTS baglanti uyarisi ({e}), Google TTS motoruna geciliyor...")
+        loop = asyncio.get_event_loop()
+        def run_gtts():
+            tts = gTTS(text=text, lang="tr", slow=False)
+            tts.save(filename)
+        await loop.run_in_executor(None, run_gtts)
+
 async def speak_in_voice(chat_id: int, text: str):
     if not call_client or not StreamClass:
         return "Ses istemcisi (UserBot) aktif degil. Render loglarina bakin."
@@ -140,8 +152,15 @@ async def speak_in_voice(chat_id: int, text: str):
     temp_mp3 = f"voice_{file_id}.mp3"
 
     try:
-        communicate = edge_tts.Communicate(text, KATYA_VOICE)
-        await communicate.save(temp_mp3)
+        # 1. Ses dosyasını oluştur (Çift motor güvencesi)
+        await text_to_speech(text, temp_mp3)
+
+        # 2. Pyrogram eşler arası (peer) önbelleğini garantiye al
+        if user_client:
+            try:
+                await user_client.get_chat(chat_id)
+            except Exception:
+                pass
 
         audio_stream = StreamClass(temp_mp3)
 
@@ -164,7 +183,7 @@ async def speak_in_voice(chat_id: int, text: str):
         log_event("ERR", f"Ses aktarim hatasi: {e}")
         return str(e)
     finally:
-        await asyncio.sleep(6)
+        await asyncio.sleep(8)
         if os.path.exists(temp_mp3):
             try:
                 os.remove(temp_mp3)
