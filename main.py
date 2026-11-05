@@ -10,8 +10,6 @@ import uvicorn
 import edge_tts
 
 from pyrogram import Client
-from pytgcalls import PyTgCalls
-from pytgcalls.types import MediaStream
 
 from telegram import Update
 from telegram.ext import (
@@ -44,25 +42,35 @@ def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
 
-# --- PyTgCalls & UserBot Kurulumu ---
+# --- PyTgCalls Güvenli Kurulumu ---
 
 user_client = None
 call_client = None
+MediaStreamClass = None
 
 if SESSION_STRING and API_ID and API_HASH:
-    user_client = Client(
-        "katya_voice_user",
-        api_id=API_ID,
-        api_hash=API_HASH,
-        session_string=SESSION_STRING,
-        in_memory=True,
-    )
-    call_client = PyTgCalls(user_client)
+    try:
+        from pytgcalls import PyTgCalls
+        from pytgcalls.types import MediaStream
+        MediaStreamClass = MediaStream
+
+        user_client = Client(
+            "katya_voice_user",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=SESSION_STRING,
+            in_memory=True,
+        )
+        call_client = PyTgCalls(user_client)
+        log_event("SYS", "PyTgCalls ve UserBot başarıyla yapılandırıldı.")
+    except Exception as e:
+        log_event("ERR", f"PyTgCalls yüklenemedi: {e}")
+        call_client = None
 
 async def speak_in_voice(chat_id: int, text: str):
     """Metni Türkçe kadın sesine çevirir ve sesli sohbete canlı basar."""
-    if not call_client:
-        return "Ses istemcisi (UserBot) aktif değil veya session eksik."
+    if not call_client or not MediaStreamClass:
+        return "Ses motoru aktif değil veya PyTgCalls yüklenemedi."
 
     mp3_file = f"voice_{abs(chat_id)}.mp3"
 
@@ -70,8 +78,7 @@ async def speak_in_voice(chat_id: int, text: str):
         communicate = edge_tts.Communicate(text, KATYA_VOICE)
         await communicate.save(mp3_file)
 
-        # py-tgcalls 2.x: MediaStream doğrudan mp3 dosyasını okur
-        stream = MediaStream(mp3_file)
+        stream = MediaStreamClass(mp3_file)
 
         if not stats["in_voice_chat"]:
             await call_client.join_group_call(chat_id, stream)
@@ -85,6 +92,13 @@ async def speak_in_voice(chat_id: int, text: str):
     except Exception as e:
         log_event("ERR", f"Ses yayın hatası: {e}")
         return str(e)
+    finally:
+        # Arka planda geçici ses dosyasını temizle
+        if os.path.exists(mp3_file):
+            try:
+                os.remove(mp3_file)
+            except Exception:
+                pass
 
 # --- Telegram Bot Komutları ---
 
@@ -103,7 +117,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def join_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     log_event("STAFF", f"Sesli odaya bağlanma istendi (Chat ID: {chat_id})")
-    await update.message.reply_text("Sesli sohbete katılıyorum...")
+    await update.message.reply_text("Sesli sohbete bağlanılıyor...")
     err = await speak_in_voice(chat_id, "Golden grubu selamlar, Katya sesli sohbete katıldı!")
     if err:
         await update.message.reply_text(f"Bağlantı hatası: {err}")
@@ -214,9 +228,12 @@ async def lifespan(app: FastAPI):
     global bot_app
     # 1. UserBot ve Ses Motorunu Başlat
     if user_client and call_client:
-        await user_client.start()
-        await call_client.start()
-        log_event("SYS", "UserBot ses istemcisi bağlandı.")
+        try:
+            await user_client.start()
+            await call_client.start()
+            log_event("SYS", "UserBot ses istemcisi bağlandı.")
+        except Exception as e:
+            log_event("ERR", f"UserBot bağlantı hatası: {e}")
 
     # 2. Telegram Botunu Başlat
     if BOT_TOKEN:
