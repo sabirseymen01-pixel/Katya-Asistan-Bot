@@ -1,9 +1,11 @@
 fastapi==0.110.0
 uvicorn==0.28.0
 python-telegram-bot==20.8
-edge-tts==6.1.10
+edge-tts>=6.1.12
+gTTS==2.5.1
 aiofiles==23.2.1
 python-dotenv==1.0.1
 pyrogram==2.0.106
 py-tgcalls==2.1.0
+tgcrypto==1.2.5
 google-genai
