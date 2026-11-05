@@ -1,6 +1,6 @@
 import os
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 from collections import deque
 from contextlib import asynccontextmanager
 
@@ -9,7 +9,11 @@ from fastapi.responses import HTMLResponse
 import uvicorn
 import edge_tts
 
-from telegram import Update, ChatPermissions
+from pyrogram import Client
+from pytgcalls import PyTgCalls
+from pytgcalls.types import AudioPiped
+
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -20,7 +24,11 @@ from telegram.ext import (
 
 # Ortam Değişkenleri
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-KATYA_VOICE = "tr-TR-EmelNeural"  # Doğal Türkçe kadın sesi
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
+
+KATYA_VOICE = "tr-TR-EmelNeural"
 
 # Staff Paneli Havuzu
 MAX_LOGS = 150
@@ -28,183 +36,172 @@ logs_queue = deque(maxlen=MAX_LOGS)
 stats = {
     "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     "total_messages": 0,
-    "voice_interactions": 0,
-    "moderation_actions": 0,
-    "warnings": {},  # {user_id: count}
-    "unique_users": set(),
+    "voice_speaks": 0,
+    "in_voice_chat": False,
 }
 
 def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
 
-# --- Ses Üretme (TTS) Yardımcısı ---
+# --- PyTgCalls & UserBot Kurulumu ---
 
-async def generate_voice(text: str, output_path: str = "katya_reply.mp3"):
+user_client = None
+call_client = None
+
+if SESSION_STRING and API_ID and API_HASH:
+    user_client = Client(
+        "katya_voice_user",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        session_string=SESSION_STRING,
+        in_memory=True
+    )
+    call_client = PyTgCalls(user_client)
+
+async def speak_in_voice(chat_id: int, text: str):
+    """Metni Türkçe kadın sesine çevirir ve sesli sohbete basar."""
+    if not call_client:
+        return "Ses istemcisi aktif değil."
+
+    mp3_file = f"voice_{chat_id}.mp3"
+    raw_file = f"voice_{chat_id}.raw"
+
     communicate = edge_tts.Communicate(text, KATYA_VOICE)
-    await communicate.save(output_path)
-    return output_path
+    await communicate.save(mp3_file)
 
-# --- Yetkilendirme & Moderasyon ---
+    # raw s16le formatına dönüştürme
+    os.system(f"ffmpeg -y -i {mp3_file} -f s16le -ac 1 -ar 48000 {raw_file}")
 
-async def is_admin(update: Update, user_id: int) -> bool:
     try:
-        admins = await update.effective_chat.get_administrators()
-        return any(admin.user.id == user_id for admin in admins)
-    except Exception:
-        return False
+        if not stats["in_voice_chat"]:
+            await call_client.join_group_call(chat_id, AudioPiped(raw_file))
+            stats["in_voice_chat"] = True
+        else:
+            await call_client.change_stream(chat_id, AudioPiped(raw_file))
+        
+        stats["voice_speaks"] += 1
+        log_event("VOICE", f"Sesli odada konuşuldu: '{text[:35]}...'")
+    except Exception as e:
+        log_event("ERR", f"Ses yayın hatası: {e}")
+        return str(e)
+    finally:
+        if os.path.exists(mp3_file):
+            os.remove(mp3_file)
 
-async def warn_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not await is_admin(update, update.effective_user.id):
-        await update.message.reply_text("Bu komut sadece Staff/Yöneticiler içindir.")
-        return
+# --- Telegram Bot Komutları ---
 
-    if not update.message.reply_to_message:
-        await update.message.reply_text("Uyarılacak kişinin mesajını yanıtlayarak `/uyar` yazın.")
-        return
-
-    target = update.message.reply_to_message.from_user
-    count = stats["warnings"].get(target.id, 0) + 1
-    stats["warnings"][target.id] = count
-    stats["moderation_actions"] += 1
-
-    log_event("STAFF", f"UYARI: @{target.username or target.id} ({count}/3)")
-
-    if count >= 3:
-        # 3. uyarıda 1 saat mute
-        until = datetime.now() + timedelta(hours=1)
-        await context.bot.restrict_chat_member(
-            chat_id=update.effective_chat.id,
-            user_id=target.id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=until
-        )
-        stats["warnings"][target.id] = 0
-        await update.message.reply_text(f"⚠️ {target.first_name} 3 uyarı sınırına ulaştığı için 1 saat susturuldu.")
-    else:
-        await update.message.reply_text(f"⚠️ {target.first_name} uyarıldı! (Uyarı: {count}/3)")
-
-# --- Sesli & Metin Etkileşim Motoru ---
-
-async def handle_voice_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gruptan gelen ses kayıtlarını yakalar ve yapay zeka ile sesli döner."""
-    stats["voice_interactions"] += 1
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    stats["unique_users"].add(user.id)
-    
-    log_event("VOICE", f"@{user.username or user.id} sesli mesaj iletti.")
-    
-    # Simüle edilen LLM cevabı (Buraya Whisper/OpenAI API bağlanabilir)
-    cevap_metni = f"Merhaba {user.first_name}, sesli mesajınızı dinledim. Golden grubunun asistanı olarak kaydettim."
-    
-    audio_file = f"voice_{user.id}.mp3"
-    await generate_voice(cevap_metni, audio_file)
-    
-    await update.message.reply_voice(voice=open(audio_file, "rb"), caption="Katya Sesli Yanıt")
-    if os.path.exists(audio_file):
-        os.remove(audio_file)
+    log_event("CMD", f"/start - @{user.username or user.id}")
+    await update.message.reply_text(
+        f"Merhaba {user.first_name}! Ben Katya Asistan.\n"
+        "Golden grubunu yönetmek ve sesli sohbete katılmak için buradayım.\n\n"
+        "Komutlar:\n"
+        "• `/seskatil` - Sesli odaya bağlanır.\n"
+        "• `/konus <mesaj>` - Canlı sesli sohbette konuşur.\n"
+        "• `/sesayril` - Sesli sohbetten çıkar."
+    )
 
-async def handle_text_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Metin filtreleme, Katya çağrıları ve genel grup akışı."""
+async def join_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    log_event("STAFF", f"Sesli odaya bağlanma istendi (Chat ID: {chat_id})")
+    await update.message.reply_text("Sesli sohbete katılıyorum...")
+    err = await speak_in_voice(chat_id, "Golden grubu selamlar, Katya sesli sohbete katıldı!")
+    if err:
+        await update.message.reply_text(f"Bağlantı hatası: {err}")
+    else:
+        await update.message.reply_text("Sesli sohbete bağlandım!")
+
+async def speak_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Lütfen konuşturmak istediğin metni yaz: `/konus Merhaba Golden!`")
+        return
+    text = " ".join(context.args)
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("Seslendiriliyor...")
+    await speak_in_voice(chat_id, text)
+
+async def leave_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if call_client and stats["in_voice_chat"]:
+        try:
+            await call_client.leave_group_call(chat_id)
+            stats["in_voice_chat"] = False
+            log_event("VOICE", "Sesli sohbetten ayrıldı.")
+            await update.message.reply_text("Sesli sohbetten ayrıldım.")
+        except Exception as e:
+            await update.message.reply_text(f"Hata: {e}")
+    else:
+        await update.message.reply_text("Zaten bir sesli sohbette değilim.")
+
+async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-        
     stats["total_messages"] += 1
     user = update.effective_user
-    stats["unique_users"].add(user.id)
     text = update.message.text
 
-    # Reklam/Spam Link Denetimi
-    if ("t.me/" in text or "http://" in text or "https://" in text) and not await is_admin(update, user.id):
-        await update.message.delete()
-        log_event("STAFF", f"SPAM SİLİNDİ: @{user.username or user.id}")
-        await context.bot.send_message(chat_id=update.effective_chat.id, text=f"⚠️ @{user.username or user.first_name}, grupta izinsiz link paylaşımı yasaktır.")
-        return
-
-    # İsmi ile seslenme tetikleyicisi
     if "katya" in text.lower():
-        log_event("AI", f"Katya etkileşimi: @{user.username or user.id}")
-        yanit = f"Buradayım {user.first_name}! Golden grubunu yönetiyor ve dinliyorum. Komutlar için /yardim yazabilirsin."
-        
-        # İsterse sesli yanıt üretip gönderme seçeneği
-        if "sesli" in text.lower() or "konuş" in text.lower():
-            ses_dosyasi = f"katya_talk_{user.id}.mp3"
-            await generate_voice(yanit, ses_dosyasi)
-            await update.message.reply_voice(voice=open(ses_dosyasi, "rb"))
-            if os.path.exists(ses_dosyasi):
-                os.remove(ses_dosyasi)
-        else:
-            await update.message.reply_text(yanit)
+        log_event("KATYA", f"@{user.username or user.id}: {text[:30]}")
+        await update.message.reply_text("Golden grubu için dinlemedeyim!")
     else:
-        log_event("MSG", f"@{user.username or user.id}: {text[:30]}")
+        log_event("MSG", f"@{user.username or user.id}: {text[:25]}")
 
-# --- Web Staff Dashboard (Arayüz) ---
+# --- FastAPI & Staff Paneli ---
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="tr">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Katya Staff Suite — Golden Admin</title>
+    <title>Katya Staff Suite</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <meta http-equiv="refresh" content="5">
     <style>
-        body {{ background-color: #080c14; color: #e2e8f0; font-family: system-ui, sans-serif; }}
-        .card {{ background-color: #0f172a; border: 1px solid #1e293b; border-radius: 10px; }}
-        .log-box {{ background: #020617; border-radius: 8px; padding: 12px; font-family: monospace; max-height: 420px; overflow-y: auto; font-size: 0.85rem; }}
+        body {{ background-color: #0b0f19; color: #f1f5f9; font-family: system-ui, sans-serif; }}
+        .card {{ background-color: #161e2e; border: 1px solid #283548; border-radius: 10px; }}
+        .log-box {{ background: #070a11; border-radius: 8px; padding: 12px; font-family: monospace; max-height: 430px; overflow-y: auto; font-size: 0.85rem; }}
         .badge-voice {{ background-color: #8b5cf6; }}
         .badge-staff {{ background-color: #ef4444; }}
-        .badge-ai {{ background-color: #06b6d4; }}
+        .badge-katya {{ background-color: #06b6d4; }}
         .badge-cmd {{ background-color: #3b82f6; }}
-        .stat-num {{ font-size: 1.8rem; font-weight: bold; color: #38bdf8; }}
     </style>
 </head>
 <body class="p-3">
     <div class="container-fluid">
-        <div class="d-flex justify-content-between align-items-center mb-3 pb-2 border-bottom border-dark">
+        <div class="d-flex justify-content-between align-items-center mb-3 pb-2 border-bottom border-secondary">
             <div>
                 <h4 class="mb-0 fw-bold">Katya Asistan <span class="badge bg-danger">Staff Panel</span></h4>
-                <small class="text-secondary">Golden Grubu Sesli ve Metin Denetim Merkezi</small>
+                <small class="text-secondary">Golden Grubu Ses & Chat Yönetim Arayüzü</small>
             </div>
-            <span class="badge bg-success px-3 py-2">Çevrimiçi & Dinlemede</span>
+            <span class="badge bg-success px-3 py-2">Çevrimiçi</span>
         </div>
 
         <div class="row g-2 mb-3">
-            <div class="col-md-3">
+            <div class="col-md-4">
                 <div class="card p-3">
                     <span class="text-secondary small">Toplam Mesaj</span>
-                    <div class="stat-num">{total_messages}</div>
+                    <h3 class="fw-bold text-info mb-0">{total_messages}</h3>
                 </div>
             </div>
-            <div class="col-md-3">
+            <div class="col-md-4">
                 <div class="card p-3">
-                    <span class="text-secondary small">Sesli İletişim (TTS/Ses)</span>
-                    <div class="stat-num text-info">{voice_interactions}</div>
+                    <span class="text-secondary small">Canlı Ses Konuşmaları</span>
+                    <h3 class="fw-bold text-warning mb-0">{voice_speaks}</h3>
                 </div>
             </div>
-            <div class="col-md-3">
+            <div class="col-md-4">
                 <div class="card p-3">
-                    <span class="text-secondary small">Moderasyon İşlemleri</span>
-                    <div class="stat-num text-warning">{moderation_actions}</div>
-                </div>
-            </div>
-            <div class="col-md-3">
-                <div class="card p-3">
-                    <span class="text-secondary small">Aktif Kullanıcı</span>
-                    <div class="stat-num text-light">{unique_users_count}</div>
+                    <span class="text-secondary small">Ses Kanalı Durumu</span>
+                    <h3 class="fw-bold mb-0 {status_color}">{voice_status}</h3>
                 </div>
             </div>
         </div>
 
         <div class="card p-3">
-            <div class="d-flex justify-content-between align-items-center mb-2">
-                <h6 class="mb-0">Canlı Sistem, Ses & Güvenlik Akışı</h6>
-                <small class="text-secondary">5 sn aralıkla yenilenir</small>
-            </div>
-            <div class="log-box">
-                {logs_html}
-            </div>
+            <h6 class="mb-2">Canlı Konsol ve Olay Kayıtları</h6>
+            <div class="log-box">{logs_html}</div>
         </div>
     </div>
 </body>
@@ -216,25 +213,28 @@ bot_app = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_app
+    # 1. UserBot ve Ses Motorunu Başlat
+    if user_client and call_client:
+        await user_client.start()
+        await call_client.start()
+        log_event("SYS", "UserBot ses istemcisi bağlandı.")
+
+    # 2. Telegram Botunu Başlat
     if BOT_TOKEN:
         bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-        
-        # Moderasyon & Komutlar
-        bot_app.add_handler(CommandHandler("uyar", warn_command))
-        
-        # Mesaj & Ses Algılayıcılar
-        bot_app.add_handler(MessageHandler(filters.VOICE, handle_voice_message))
-        bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), handle_text_messages))
+        bot_app.add_handler(CommandHandler("start", start_cmd))
+        bot_app.add_handler(CommandHandler("seskatil", join_voice_cmd))
+        bot_app.add_handler(CommandHandler("konus", speak_cmd))
+        bot_app.add_handler(CommandHandler("sesayril", leave_voice_cmd))
+        bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
 
         await bot_app.initialize()
         await bot_app.start()
         await bot_app.updater.start_polling()
-        log_event("SYS", "Katya ses ve yönetim motoru başlatıldı.")
-    else:
-        log_event("ERR", "BOT_TOKEN eksik!")
-        
+        log_event("SYS", "Katya Bot dinlemede.")
+
     yield
-    
+
     if bot_app:
         await bot_app.updater.stop()
         await bot_app.stop()
@@ -247,7 +247,7 @@ async def dashboard():
     badge_map = {
         "VOICE": "badge-voice",
         "STAFF": "badge-staff",
-        "AI": "badge-ai",
+        "KATYA": "badge-katya",
         "CMD": "badge-cmd",
         "SYS": "bg-secondary",
         "MSG": "bg-dark"
@@ -260,11 +260,14 @@ async def dashboard():
             f"<span class='badge {badge_cls}'>{log['level']}</span> {log['message']}</div>"
         )
 
+    v_status = "Odaya Bağlı" if stats["in_voice_chat"] else "Bağlı Değil"
+    v_color = "text-success" if stats["in_voice_chat"] else "text-secondary"
+
     rendered = HTML_TEMPLATE.format(
         total_messages=stats["total_messages"],
-        voice_interactions=stats["voice_interactions"],
-        moderation_actions=stats["moderation_actions"],
-        unique_users_count=len(stats["unique_users"]),
+        voice_speaks=stats["voice_speaks"],
+        voice_status=v_status,
+        status_color=v_color,
         logs_html="".join(logs_html_list) if logs_html_list else "<span class='text-muted'>Veri bekleniyor...</span>"
     )
     return HTMLResponse(content=rendered)
