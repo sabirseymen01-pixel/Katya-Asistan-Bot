@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: Katya-Asistan-Bot
+    env: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 10000
