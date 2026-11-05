@@ -42,17 +42,13 @@ def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
 
-# --- PyTgCalls Güvenli Kurulumu ---
+# --- PyTgCalls Güvenli Kurulumu (Uygulamayı Asla Çökertmez) ---
 
 user_client = None
 call_client = None
 AudioPipedClass = None
 
-def init_voice():
-    global user_client, call_client, AudioPipedClass
-    if not (SESSION_STRING and API_ID and API_HASH):
-        log_event("SYS", "UserBot değişkenleri eksik, ses devre dışı.")
-        return
+if SESSION_STRING and API_ID and API_HASH:
     try:
         from pytgcalls import PyTgCalls
         from pytgcalls.types.input_stream import AudioPiped
@@ -66,12 +62,10 @@ def init_voice():
             in_memory=True,
         )
         call_client = PyTgCalls(user_client)
-        log_event("SYS", "PyTgCalls ve UserBot başarıyla bağlandı.")
+        log_event("SYS", "UserBot ve PyTgCalls nesnesi hazırlandı.")
     except Exception as e:
-        log_event("ERR", f"PyTgCalls başlatılamadı: {e}")
+        log_event("ERR", f"PyTgCalls yükleme hatası: {e}")
         call_client = None
-
-init_voice()
 
 async def speak_in_voice(chat_id: int, text: str):
     """Metni Türkçe kadın sesine çevirir ve sesli sohbete basar."""
@@ -236,23 +230,26 @@ async def lifespan(app: FastAPI):
         try:
             await user_client.start()
             await call_client.start()
-            log_event("SYS", "UserBot ses motoru aktif.")
+            log_event("SYS", "UserBot ses istemcisi bağlandı.")
         except Exception as e:
             log_event("ERR", f"UserBot bağlantı hatası: {e}")
 
     # 2. Telegram Botunu Başlat
     if BOT_TOKEN:
-        bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
-        bot_app.add_handler(CommandHandler("start", start_cmd))
-        bot_app.add_handler(CommandHandler("seskatil", join_voice_cmd))
-        bot_app.add_handler(CommandHandler("konus", speak_cmd))
-        bot_app.add_handler(CommandHandler("sesayril", leave_voice_cmd))
-        bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
+        try:
+            bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
+            bot_app.add_handler(CommandHandler("start", start_cmd))
+            bot_app.add_handler(CommandHandler("seskatil", join_voice_cmd))
+            bot_app.add_handler(CommandHandler("konus", speak_cmd))
+            bot_app.add_handler(CommandHandler("sesayril", leave_voice_cmd))
+            bot_app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), message_handler))
 
-        await bot_app.initialize()
-        await bot_app.start()
-        await bot_app.updater.start_polling()
-        log_event("SYS", "Katya Bot dinlemede.")
+            await bot_app.initialize()
+            await bot_app.start()
+            await bot_app.updater.start_polling()
+            log_event("SYS", "Katya Bot dinlemede.")
+        except Exception as e:
+            log_event("ERR", f"Telegram bot başlatma hatası: {e}")
 
     yield
 
