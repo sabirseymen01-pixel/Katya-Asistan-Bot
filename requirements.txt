@@ -1,5 +1,5 @@
 pyrogram==2.0.106
-py-tgcalls==1.1.8
+py-tgcalls>=2.0.0
 python-telegram-bot==20.8
 fastapi==0.110.0
 uvicorn==0.28.0
