@@ -42,21 +42,30 @@ def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
 
-# --- PyTgCalls Güvenli Kurulumu (Uygulamayı Asla Durdurmaz) ---
+# --- PyTgCalls Güvenli Değişkenleri ---
 
 user_client = None
 call_client = None
 AudioPipedClass = None
 
-def setup_voice():
+async def init_voice_engine():
+    """Ses motorunu arka planda güvenle başlatır, ana sunucuyu çökertmez."""
     global user_client, call_client, AudioPipedClass
     if not (SESSION_STRING and API_ID and API_HASH):
-        log_event("SYS", "UserBot değişkenleri eksik, ses devre dışı.")
+        log_event("SYS", "UserBot session veya API bilgileri eksik. Ses devre dışı.")
         return
+
     try:
         from pytgcalls import PyTgCalls
-        from pytgcalls.types.input_stream import AudioPiped
-        AudioPipedClass = AudioPiped
+        try:
+            from pytgcalls.types.input_stream import AudioPiped
+            AudioPipedClass = AudioPiped
+        except Exception:
+            try:
+                from pytgcalls.types import AudioPiped
+                AudioPipedClass = AudioPiped
+            except Exception:
+                AudioPipedClass = None
 
         user_client = Client(
             "katya_voice_user",
@@ -66,17 +75,17 @@ def setup_voice():
             in_memory=True,
         )
         call_client = PyTgCalls(user_client)
-        log_event("SYS", "UserBot ve PyTgCalls bağlandı.")
+        await user_client.start()
+        await call_client.start()
+        log_event("SYS", "UserBot ve PyTgCalls başarıyla bağlandı.")
     except Exception as e:
-        log_event("ERR", f"PyTgCalls başlatma uyarısı: {e}")
+        log_event("ERR", f"Ses motoru başlatılamadı: {e}")
         call_client = None
-
-setup_voice()
 
 async def speak_in_voice(chat_id: int, text: str):
     """Metni Türkçe kadın sesine çevirir ve sesli sohbete basar."""
     if not call_client or not AudioPipedClass:
-        return "Ses istemcisi (UserBot) aktif değil veya session geçersiz."
+        return "Ses istemcisi (UserBot) aktif değil veya kütüphane uyumsuz."
 
     mp3_file = f"voice_{abs(chat_id)}.mp3"
 
@@ -231,14 +240,9 @@ bot_app = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_app
-    # 1. UserBot ve Ses Motorunu Başlat
-    if user_client and call_client:
-        try:
-            await user_client.start()
-            await call_client.start()
-            log_event("SYS", "UserBot ses motoru bağlandı.")
-        except Exception as e:
-            log_event("ERR", f"UserBot bağlantı hatası: {e}")
+    
+    # 1. Ses motorunu arka planda non-blocking olarak dene
+    asyncio.create_task(init_voice_engine())
 
     # 2. Telegram Botunu Başlat
     if BOT_TOKEN:
@@ -253,16 +257,25 @@ async def lifespan(app: FastAPI):
             await bot_app.initialize()
             await bot_app.start()
             await bot_app.updater.start_polling()
-            log_event("SYS", "Katya Bot dinlemede.")
+            log_event("SYS", "Katya Telegram bot dinlemede.")
         except Exception as e:
-            log_event("ERR", f"Bot başlatma hatası: {e}")
+            log_event("ERR", f"Telegram bot başlatma hatası: {e}")
 
     yield
 
     if bot_app:
-        await bot_app.updater.stop()
-        await bot_app.stop()
-        await bot_app.shutdown()
+        try:
+            await bot_app.updater.stop()
+            await bot_app.stop()
+            await bot_app.shutdown()
+        except Exception:
+            pass
+
+    if call_client:
+        try:
+            await call_client.stop()
+        except Exception:
+            pass
 
 app = FastAPI(lifespan=lifespan)
 
