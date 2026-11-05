@@ -42,17 +42,17 @@ def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
 
-# --- PyTgCalls Güvenli Kurulumu ---
+# --- PyTgCalls Kurulumu ---
 
 user_client = None
 call_client = None
-MediaStreamClass = None
+AudioPipedClass = None
 
 if SESSION_STRING and API_ID and API_HASH:
     try:
         from pytgcalls import PyTgCalls
-        from pytgcalls.types import MediaStream
-        MediaStreamClass = MediaStream
+        from pytgcalls.types.input_stream import AudioPiped
+        AudioPipedClass = AudioPiped
 
         user_client = Client(
             "katya_voice_user",
@@ -62,15 +62,15 @@ if SESSION_STRING and API_ID and API_HASH:
             in_memory=True,
         )
         call_client = PyTgCalls(user_client)
-        log_event("SYS", "PyTgCalls ve UserBot başarıyla yapılandırıldı.")
+        log_event("SYS", "UserBot ve PyTgCalls nesnesi hazırlandı.")
     except Exception as e:
-        log_event("ERR", f"PyTgCalls yüklenemedi: {e}")
+        log_event("ERR", f"PyTgCalls başlatma hatası: {e}")
         call_client = None
 
 async def speak_in_voice(chat_id: int, text: str):
-    """Metni Türkçe kadın sesine çevirir ve sesli sohbete canlı basar."""
-    if not call_client or not MediaStreamClass:
-        return "Ses motoru aktif değil veya PyTgCalls yüklenemedi."
+    """Metni Türkçe kadın sesine çevirir ve sesli sohbete basar."""
+    if not call_client or not AudioPipedClass:
+        return "Ses istemcisi (UserBot) aktif değil."
 
     mp3_file = f"voice_{abs(chat_id)}.mp3"
 
@@ -78,7 +78,7 @@ async def speak_in_voice(chat_id: int, text: str):
         communicate = edge_tts.Communicate(text, KATYA_VOICE)
         await communicate.save(mp3_file)
 
-        stream = MediaStreamClass(mp3_file)
+        stream = AudioPipedClass(mp3_file)
 
         if not stats["in_voice_chat"]:
             await call_client.join_group_call(chat_id, stream)
@@ -92,13 +92,6 @@ async def speak_in_voice(chat_id: int, text: str):
     except Exception as e:
         log_event("ERR", f"Ses yayın hatası: {e}")
         return str(e)
-    finally:
-        # Arka planda geçici ses dosyasını temizle
-        if os.path.exists(mp3_file):
-            try:
-                os.remove(mp3_file)
-            except Exception:
-                pass
 
 # --- Telegram Bot Komutları ---
 
