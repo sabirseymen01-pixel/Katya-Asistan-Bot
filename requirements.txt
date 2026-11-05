@@ -5,4 +5,4 @@ edge-tts==6.1.10
 aiofiles==23.2.1
 python-dotenv==1.0.1
 pyrogram==2.0.103
-pytgcalls==0.9.3
+pytgcalls==1.0.0
