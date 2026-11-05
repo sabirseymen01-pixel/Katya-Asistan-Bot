@@ -4,7 +4,6 @@ python-telegram-bot==20.8
 fastapi==0.110.0
 uvicorn==0.28.0
 edge-tts==6.1.10
-openai==1.14.0
-python-dotenv==1.0.1
-aiofiles==23.2.1
 tgcrypto==1.2.5
+aiofiles==23.2.1
+python-dotenv==1.0.1
