@@ -11,7 +11,7 @@ import edge_tts
 
 from pyrogram import Client
 from pytgcalls import PyTgCalls
-from pytgcalls.types import AudioPiped
+from pytgcalls.types import MediaStream
 
 from telegram import Update
 from telegram.ext import (
@@ -55,39 +55,36 @@ if SESSION_STRING and API_ID and API_HASH:
         api_id=API_ID,
         api_hash=API_HASH,
         session_string=SESSION_STRING,
-        in_memory=True
+        in_memory=True,
     )
     call_client = PyTgCalls(user_client)
 
 async def speak_in_voice(chat_id: int, text: str):
-    """Metni Türkçe kadın sesine çevirir ve sesli sohbete basar."""
+    """Metni Türkçe kadın sesine çevirir ve sesli sohbete canlı basar."""
     if not call_client:
-        return "Ses istemcisi aktif değil."
+        return "Ses istemcisi (UserBot) aktif değil veya session eksik."
 
-    mp3_file = f"voice_{chat_id}.mp3"
-    raw_file = f"voice_{chat_id}.raw"
-
-    communicate = edge_tts.Communicate(text, KATYA_VOICE)
-    await communicate.save(mp3_file)
-
-    # raw s16le formatına dönüştürme
-    os.system(f"ffmpeg -y -i {mp3_file} -f s16le -ac 1 -ar 48000 {raw_file}")
+    mp3_file = f"voice_{abs(chat_id)}.mp3"
 
     try:
+        communicate = edge_tts.Communicate(text, KATYA_VOICE)
+        await communicate.save(mp3_file)
+
+        # py-tgcalls 2.x: MediaStream doğrudan mp3 dosyasını okur
+        stream = MediaStream(mp3_file)
+
         if not stats["in_voice_chat"]:
-            await call_client.join_group_call(chat_id, AudioPiped(raw_file))
+            await call_client.join_group_call(chat_id, stream)
             stats["in_voice_chat"] = True
         else:
-            await call_client.change_stream(chat_id, AudioPiped(raw_file))
-        
+            await call_client.change_stream(chat_id, stream)
+
         stats["voice_speaks"] += 1
         log_event("VOICE", f"Sesli odada konuşuldu: '{text[:35]}...'")
+        return None
     except Exception as e:
         log_event("ERR", f"Ses yayın hatası: {e}")
         return str(e)
-    finally:
-        if os.path.exists(mp3_file):
-            os.remove(mp3_file)
 
 # --- Telegram Bot Komutları ---
 
@@ -120,7 +117,9 @@ async def speak_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args)
     chat_id = update.effective_chat.id
     await update.message.reply_text("Seslendiriliyor...")
-    await speak_in_voice(chat_id, text)
+    err = await speak_in_voice(chat_id, text)
+    if err:
+        await update.message.reply_text(f"Konuşma hatası: {err}")
 
 async def leave_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -250,7 +249,7 @@ async def dashboard():
         "KATYA": "badge-katya",
         "CMD": "badge-cmd",
         "SYS": "bg-secondary",
-        "MSG": "bg-dark"
+        "MSG": "bg-dark",
     }
     logs_html_list = []
     for log in logs_queue:
@@ -268,7 +267,7 @@ async def dashboard():
         voice_speaks=stats["voice_speaks"],
         voice_status=v_status,
         status_color=v_color,
-        logs_html="".join(logs_html_list) if logs_html_list else "<span class='text-muted'>Veri bekleniyor...</span>"
+        logs_html="".join(logs_html_list) if logs_html_list else "<span class='text-muted'>Veri bekleniyor...</span>",
     )
     return HTMLResponse(content=rendered)
 
