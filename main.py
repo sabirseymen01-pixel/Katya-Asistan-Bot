@@ -42,13 +42,17 @@ def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
 
-# --- PyTgCalls Güvenli Kurulumu (Uygulamayı Asla Çökertmez) ---
+# --- PyTgCalls Güvenli Kurulumu (Uygulamayı Asla Durdurmaz) ---
 
 user_client = None
 call_client = None
 AudioPipedClass = None
 
-if SESSION_STRING and API_ID and API_HASH:
+def setup_voice():
+    global user_client, call_client, AudioPipedClass
+    if not (SESSION_STRING and API_ID and API_HASH):
+        log_event("SYS", "UserBot değişkenleri eksik, ses devre dışı.")
+        return
     try:
         from pytgcalls import PyTgCalls
         from pytgcalls.types.input_stream import AudioPiped
@@ -62,10 +66,12 @@ if SESSION_STRING and API_ID and API_HASH:
             in_memory=True,
         )
         call_client = PyTgCalls(user_client)
-        log_event("SYS", "UserBot ve PyTgCalls nesnesi hazırlandı.")
+        log_event("SYS", "UserBot ve PyTgCalls bağlandı.")
     except Exception as e:
-        log_event("ERR", f"PyTgCalls yükleme hatası: {e}")
+        log_event("ERR", f"PyTgCalls başlatma uyarısı: {e}")
         call_client = None
+
+setup_voice()
 
 async def speak_in_voice(chat_id: int, text: str):
     """Metni Türkçe kadın sesine çevirir ve sesli sohbete basar."""
@@ -230,7 +236,7 @@ async def lifespan(app: FastAPI):
         try:
             await user_client.start()
             await call_client.start()
-            log_event("SYS", "UserBot ses istemcisi bağlandı.")
+            log_event("SYS", "UserBot ses motoru bağlandı.")
         except Exception as e:
             log_event("ERR", f"UserBot bağlantı hatası: {e}")
 
@@ -249,7 +255,7 @@ async def lifespan(app: FastAPI):
             await bot_app.updater.start_polling()
             log_event("SYS", "Katya Bot dinlemede.")
         except Exception as e:
-            log_event("ERR", f"Telegram bot başlatma hatası: {e}")
+            log_event("ERR", f"Bot başlatma hatası: {e}")
 
     yield
 
