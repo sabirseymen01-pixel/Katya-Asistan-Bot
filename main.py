@@ -42,13 +42,17 @@ def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
 
-# --- PyTgCalls Kurulumu ---
+# --- PyTgCalls Güvenli Kurulumu ---
 
 user_client = None
 call_client = None
 AudioPipedClass = None
 
-if SESSION_STRING and API_ID and API_HASH:
+def init_voice():
+    global user_client, call_client, AudioPipedClass
+    if not (SESSION_STRING and API_ID and API_HASH):
+        log_event("SYS", "UserBot değişkenleri eksik, ses devre dışı.")
+        return
     try:
         from pytgcalls import PyTgCalls
         from pytgcalls.types.input_stream import AudioPiped
@@ -62,15 +66,17 @@ if SESSION_STRING and API_ID and API_HASH:
             in_memory=True,
         )
         call_client = PyTgCalls(user_client)
-        log_event("SYS", "PyTgCalls ve UserBot hazırlandı.")
+        log_event("SYS", "PyTgCalls ve UserBot başarıyla bağlandı.")
     except Exception as e:
-        log_event("ERR", f"PyTgCalls başlatma hatası: {e}")
+        log_event("ERR", f"PyTgCalls başlatılamadı: {e}")
         call_client = None
+
+init_voice()
 
 async def speak_in_voice(chat_id: int, text: str):
     """Metni Türkçe kadın sesine çevirir ve sesli sohbete basar."""
     if not call_client or not AudioPipedClass:
-        return "Ses istemcisi (UserBot) aktif değil."
+        return "Ses istemcisi (UserBot) aktif değil veya session geçersiz."
 
     mp3_file = f"voice_{abs(chat_id)}.mp3"
 
@@ -230,7 +236,7 @@ async def lifespan(app: FastAPI):
         try:
             await user_client.start()
             await call_client.start()
-            log_event("SYS", "UserBot ses istemcisi bağlandı.")
+            log_event("SYS", "UserBot ses motoru aktif.")
         except Exception as e:
             log_event("ERR", f"UserBot bağlantı hatası: {e}")
 
@@ -288,5 +294,5 @@ async def dashboard():
     return HTMLResponse(content=rendered)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
