@@ -4,5 +4,6 @@ python-telegram-bot==20.8
 edge-tts==6.1.10
 aiofiles==23.2.1
 python-dotenv==1.0.1
-pyrogram==2.0.103
-pytgcalls==0.9.3
+pyrogram==2.0.106
+pytgcalls==3.0.0.dev6
+ntgcalls==1.1.2
