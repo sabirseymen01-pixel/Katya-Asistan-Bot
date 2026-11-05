@@ -7,6 +7,9 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import uvicorn
+import edge_tts
+
+from pyrogram import Client
 
 from telegram import Update
 from telegram.ext import (
@@ -17,11 +20,13 @@ from telegram.ext import (
     filters,
 )
 
-# Ses motorunu içeren harici modül
-import voice
-
 # Ortam Değişkenleri
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH", "")
+SESSION_STRING = os.getenv("SESSION_STRING", "")
+
+KATYA_VOICE = "tr-TR-EmelNeural"
 
 # Staff Paneli Havuzu
 MAX_LOGS = 150
@@ -36,6 +41,97 @@ stats = {
 def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
+
+# --- Ses Motoru (İzole, Çökmeyi Önler) ---
+
+user_client = None
+call_client = None
+StreamClass = None
+
+async def init_voice_engine():
+    global user_client, call_client, StreamClass
+    if not (SESSION_STRING and API_ID and API_HASH):
+        log_event("SYS", "UserBot değişkenleri eksik, ses devre dışı.")
+        return
+
+    try:
+        from pytgcalls import PyTgCalls
+        try:
+            from pytgcalls.types import MediaStream
+            StreamClass = MediaStream
+        except Exception:
+            try:
+                from pytgcalls.types.input_stream import AudioPiped
+                StreamClass = AudioPiped
+            except Exception:
+                from pytgcalls.types import AudioPiped
+                StreamClass = AudioPiped
+
+        user_client = Client(
+            "katya_assistant_user",
+            api_id=API_ID,
+            api_hash=API_HASH,
+            session_string=SESSION_STRING,
+            in_memory=True
+        )
+        call_client = PyTgCalls(user_client)
+        await user_client.start()
+        await call_client.start()
+        log_event("SYS", "UserBot ve PyTgCalls aktif.")
+    except Exception as e:
+        log_event("ERR", f"Ses motoru yükleme uyarısı: {e}")
+        call_client = None
+
+async def speak_in_voice(chat_id: int, text: str):
+    if not call_client or not StreamClass:
+        return "Ses istemcisi aktif değil veya kütüphane uyumsuz."
+
+    file_id = f"{abs(chat_id)}_{int(asyncio.get_event_loop().time())}"
+    temp_mp3 = f"voice_{file_id}.mp3"
+
+    try:
+        communicate = edge_tts.Communicate(text, KATYA_VOICE)
+        await communicate.save(temp_mp3)
+
+        audio_stream = StreamClass(temp_mp3)
+
+        try:
+            if hasattr(call_client, "play"):
+                await call_client.play(chat_id, audio_stream)
+            else:
+                await call_client.join_group_call(chat_id, audio_stream)
+        except Exception:
+            if hasattr(call_client, "change_stream"):
+                await call_client.change_stream(chat_id, audio_stream)
+            elif hasattr(call_client, "play"):
+                await call_client.play(chat_id, audio_stream)
+
+        stats["in_voice_chat"] = True
+        stats["voice_speaks"] += 1
+        log_event("VOICE", f"Sesli odada konuşuldu: '{text[:35]}...'")
+        return None
+    except Exception as e:
+        log_event("ERR", f"Ses yayın hatası: {e}")
+        return str(e)
+    finally:
+        await asyncio.sleep(5)
+        if os.path.exists(temp_mp3):
+            try:
+                os.remove(temp_mp3)
+            except Exception:
+                pass
+
+async def leave_voice(chat_id: int):
+    if call_client:
+        try:
+            if hasattr(call_client, "leave_call"):
+                await call_client.leave_call(chat_id)
+            else:
+                await call_client.leave_group_call(chat_id)
+            stats["in_voice_chat"] = False
+            log_event("VOICE", "Sesli sohbetten ayrıldı.")
+        except Exception as e:
+            log_event("ERR", f"Ayrılma hatası: {e}")
 
 # --- Telegram Bot Komutları ---
 
@@ -55,46 +151,31 @@ async def join_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     log_event("STAFF", f"Sesli odaya bağlanma istendi (Chat ID: {chat_id})")
     await update.message.reply_text("Sesli sohbete bağlanılıyor...")
-    
-    err = await voice.join_and_speak(chat_id, "Golden grubu selamlar, Katya sesli sohbete katıldı!")
+    err = await speak_in_voice(chat_id, "Golden grubu selamlar, Katya sesli sohbete katıldı!")
     if err:
-        log_event("ERR", f"Bağlantı hatası: {err}")
         await update.message.reply_text(f"Bağlantı hatası: {err}")
     else:
-        stats["in_voice_chat"] = True
-        stats["voice_speaks"] += 1
-        log_event("VOICE", "Sesli sohbete katılındı.")
         await update.message.reply_text("Sesli sohbete bağlandım!")
 
 async def speak_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Lütfen konuşturmak istediğin metni yaz: `/konus Merhaba Golden!`")
         return
-        
     text = " ".join(context.args)
     chat_id = update.effective_chat.id
     await update.message.reply_text("Seslendiriliyor...")
-    
-    err = await voice.join_and_speak(chat_id, text)
+    err = await speak_in_voice(chat_id, text)
     if err:
-        log_event("ERR", f"Ses yayın hatası: {err}")
         await update.message.reply_text(f"Konuşma hatası: {err}")
-    else:
-        stats["in_voice_chat"] = True
-        stats["voice_speaks"] += 1
-        log_event("VOICE", f"Sesli odada konuşuldu: '{text[:35]}...'")
 
 async def leave_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    await voice.leave_voice(chat_id)
-    stats["in_voice_chat"] = False
-    log_event("VOICE", "Sesli sohbetten ayrıldı.")
+    await leave_voice(chat_id)
     await update.message.reply_text("Sesli sohbetten ayrıldım.")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
-        
     stats["total_messages"] += 1
     user = update.effective_user
     text = update.message.text
@@ -171,8 +252,8 @@ bot_app = None
 async def lifespan(app: FastAPI):
     global bot_app
     
-    # 1. Ses motorunu arka planda non-blocking olarak başlat
-    asyncio.create_task(voice.start_voice_client())
+    # 1. Ses motorunu arka planda başlat (ana sunucuyu asla engellemez)
+    asyncio.create_task(init_voice_engine())
 
     # 2. Telegram Botunu Başlat
     if BOT_TOKEN:
@@ -187,13 +268,12 @@ async def lifespan(app: FastAPI):
             await bot_app.initialize()
             await bot_app.start()
             await bot_app.updater.start_polling()
-            log_event("SYS", "Katya Telegram bot dinlemede.")
+            log_event("SYS", "Katya Bot dinlemede.")
         except Exception as e:
-            log_event("ERR", f"Telegram bot başlatma hatası: {e}")
+            log_event("ERR", f"Bot hatası: {e}")
 
     yield
 
-    # Kapanış işlemleri
     if bot_app:
         try:
             await bot_app.updater.stop()
@@ -202,7 +282,11 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass
 
-    await voice.stop_voice_client()
+    if call_client:
+        try:
+            await call_client.stop()
+        except Exception:
+            pass
 
 app = FastAPI(lifespan=lifespan)
 
