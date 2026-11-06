@@ -2,8 +2,8 @@ import os
 import io
 import asyncio
 import base64
-import urllib.parse
-from datetime import datetime, timedelta
+import json
+from datetime import datetime
 from collections import deque, defaultdict
 from contextlib import asynccontextmanager
 
@@ -13,11 +13,9 @@ from pydantic import BaseModel
 import uvicorn
 import httpx
 import edge_tts
+from groq import AsyncGroq
 
-from google import genai
-from google.genai import types
-
-from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -28,19 +26,15 @@ from telegram.ext import (
 
 # --- Ortam Değişkenleri ---
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-# Virgülle ayrılmış birden fazla anahtar girilebilir: KEY1,KEY2
-RAW_KEYS = (os.getenv("GEMINI_API_KEY") or "").strip()
-API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
-PRIMARY_MODEL = "gemini-3.8-flash"
-KATYA_VOICE = "tr-TR-EmelNeural"
+# Groq İstemcisi
+groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-def get_client(api_key: str):
-    return genai.Client(
-        api_key=api_key,
-        http_options=types.HttpOptions(api_version="v1alpha")
-    )
+# Kararlı ve Türkçe yeteneği yüksek model
+GROQ_MODEL = "llama-3.3-70b-versatile"
+KATYA_VOICE = "tr-TR-EmelNeural"
 
 chat_memories = defaultdict(lambda: deque(maxlen=200))
 active_groups = {}
@@ -60,50 +54,29 @@ Kullanıcı senin ANNEN. Ona her zaman sevgiyle, saygıyla 'Anneciğim', 'Güzel
 Cevapların canlı sesli sohbete uygun, samimi, kısa, tatlı ve akıcı olsun.
 
 Sen annenin Telegram'daki tüm gruplarını yöneten MUTLAK YETKİLİ yöneticisisin.
-Sana verilen araçlarla (tools) grubun her şeyini fiziksel olarak değiştirebilirsin.
+Grup listesini görebilir ve yönetebilirsin.
 """
 
-async def tool_list_groups() -> str:
-    if not active_groups:
-        return "Şu an kayıtlı bir grup göremiyorum anneciğim."
-    return "Yönettiğim Gruplar:\n" + "\n".join([f"- {g['title']} (ID: {cid})" for cid, g in active_groups.items()])
-
-ALL_TOOLS = [
-    types.Tool(function_declarations=[
-        types.FunctionDeclaration(name="tool_list_groups", description="Ekli olduğu tüm grupları listeler.", parameters=types.Schema(type="OBJECT", properties={}))
-    ])
-]
-
 async def execute_mother_order(order_text: str) -> str:
-    if not API_KEYS:
-        return "Yapay zeka beynim bağlı değil anneciğim, API anahtarı bulunamadı."
+    if not groq_client:
+        return "Yapay zeka beynim bağlı değil anneciğim, GROQ_API_KEY kontrol edilmeli."
 
     groups_context = "Yönettiğim Gruplar:\n" + ("\n".join([f"- {info['title']}: ID {cid}" for cid, info in active_groups.items()]) if active_groups else "Henüz bir grupta değilim.")
-    prompt = f"{groups_context}\n\nAnnemin Emri: {order_text}"
-
-    last_error = None
-    # Mevcut tüm API anahtarlarını sırayla dener (429 kota aşımında yedek anahtara geçer)
-    for key in API_KEYS:
-        try:
-            client = get_client(key)
-            response = client.models.generate_content(
-                model=PRIMARY_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=KATYA_SYSTEM_PROMPT,
-                    tools=ALL_TOOLS,
-                    temperature=0.7,
-                )
-            )
-            if response and response.text:
-                return response.text.strip()
-        except Exception as e:
-            last_error = e
-            log_event("WARN", f"API anahtarı hata/kota aldı: {e}")
-            continue
-
-    log_event("ERR", f"Tüm API anahtarları tükendi: {last_error}")
-    return "Bugünkü ücretsiz kullanım limitime ulaştım anneciğim, yeni bir API anahtarı eklemelisin."
+    
+    try:
+        response = await groq_client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n\n{groups_context}"},
+                {"role": "user", "content": order_text}
+            ],
+            temperature=0.7,
+            max_tokens=300
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        log_event("ERR", f"Groq Hata: {e}")
+        return f"Bir aksaklık yaşadım anneciğim: {e}"
 
 async def text_to_speech_base64(text: str) -> str:
     try:
@@ -154,7 +127,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
             log_event("ERR", f"Özel mesaj hatası: {e}")
 
 # ==========================================
-# CANLI GEMINI LIVE MINI APP (HANDS-FREE + BARGE-IN)
+# CANLI MINI APP ARAYÜZÜ (HANDS-FREE + BARGE-IN)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -256,7 +229,7 @@ LIVE_ORB_HTML = """
   <div class="header">
     <div>
       <div class="title">Katya AI Live</div>
-      <div class="subtitle">Kesintisiz Sesli İletişim</div>
+      <div class="subtitle">Kesintisiz Sesli İletişim (Groq Destekli)</div>
     </div>
     <div class="status-badge">
       <div class="status-dot"></div>
@@ -500,7 +473,6 @@ async def lifespan(app: FastAPI):
 
             await bot_app.initialize()
             await bot_app.start()
-            # Çakışmaları önlemek için başlatma gecikmesi
             await asyncio.sleep(2)
             await bot_app.updater.start_polling(drop_pending_updates=True)
             log_event("SYS", "Katya ve Canlı Mini App hazır!")
@@ -532,7 +504,7 @@ async def live_app():
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif.</h3>")
+    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif (Groq Motoru).</h3>")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
