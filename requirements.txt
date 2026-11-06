@@ -3,3 +3,4 @@ uvicorn[standard]
 python-telegram-bot
 google-genai
 httpx
+edge-tts
