@@ -1,6 +1,7 @@
 import os
 import io
 import asyncio
+import base64
 import urllib.parse
 from datetime import datetime, timedelta
 from collections import deque, defaultdict
@@ -11,6 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
 import httpx
+import edge_tts
 
 from google import genai
 from google.genai import types
@@ -29,15 +31,16 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
-# Gemini Güncel Model
 GEMINI_MODEL = "gemini-3.8-flash"
+# Türkçe Doğal Kadın Sesi (Emel veya Dilara)
+KATYA_VOICE = "tr-TR-EmelNeural" 
 
 ai_client = None
 if GEMINI_API_KEY:
     try:
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception as e:
-        print(f"[AI HATA] Gemini bağlantı hatası: {e}", flush=True)
+        print(f"[AI HATA] Gemini: {e}", flush=True)
 
 chat_memories = defaultdict(lambda: deque(maxlen=200))
 active_groups = {}
@@ -73,7 +76,7 @@ ALL_TOOLS = [
 
 async def execute_mother_order(order_text: str) -> str:
     if not ai_client:
-        return "Yapay zeka beynim bağlı değil anneciğim, GEMINI_API_KEY kontrol edilmeli."
+        return "Yapay zeka beynim bağlı değil anneciğim."
 
     groups_context = "Yönettiğim Gruplar:\n" + ("\n".join([f"- {info['title']}: ID {cid}" for cid, info in active_groups.items()]) if active_groups else "Henüz bir grupta değilim.")
     prompt = f"{groups_context}\n\nAnnemin Emri: {order_text}"
@@ -92,6 +95,19 @@ async def execute_mother_order(order_text: str) -> str:
     except Exception as e:
         log_event("ERR", f"AI Hatası: {e}")
         return f"Bir aksaklık yaşadım anneciğim: {e}"
+
+async def text_to_speech_base64(text: str) -> str:
+    """Türkçe kadın sesi üretip base64 formatında döner."""
+    try:
+        communicate = edge_tts.Communicate(text, KATYA_VOICE, rate="+10%", pitch="+5Hz")
+        audio_data = bytearray()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data.extend(chunk["data"])
+        return base64.b64encode(audio_data).decode("utf-8")
+    except Exception as e:
+        log_event("ERR", f"TTS Üretim Hatası: {e}")
+        return ""
 
 # ==========================================
 # TELEGRAM MESAJLARI
@@ -130,7 +146,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
             log_event("ERR", f"Özel mesaj yanıtlama hatası: {e}")
 
 # ==========================================
-# CANLI SES & MINI APP ARAYÜZÜ (TTS + STT)
+# CANLI MINI APP ARAYÜZÜ (KADIN SESİ ENTEGRELİ)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -204,24 +220,25 @@ LIVE_ORB_HTML = """
       pointer-events: none;
     }
     .speech-box {
-      background: rgba(22, 10, 36, 0.75);
+      background: rgba(22, 10, 36, 0.85);
       backdrop-filter: blur(16px);
-      border: 1px solid rgba(255, 45, 120, 0.25);
+      border: 1px solid rgba(255, 45, 120, 0.3);
       border-radius: 16px;
-      padding: 12px 18px;
+      padding: 14px 20px;
       text-align: center;
       max-width: 90%;
       font-size: 14px;
       color: #fce7f3;
-      box-shadow: 0 8px 32px rgba(157, 0, 255, 0.15);
-      min-height: 48px;
+      box-shadow: 0 8px 32px rgba(157, 0, 255, 0.2);
+      min-height: 52px;
       display: flex;
       align-items: center;
       justify-content: center;
+      line-height: 1.4;
     }
     .hint-text {
       font-size: 11px;
-      color: rgba(244, 114, 182, 0.6);
+      color: rgba(244, 114, 182, 0.7);
       text-transform: uppercase;
       letter-spacing: 1px;
     }
@@ -272,8 +289,8 @@ LIVE_ORB_HTML = """
 
     let isListening = false;
     let isSpeaking = false;
+    let currentAudio = null;
     let recognition = null;
-    let synth = window.speechSynthesis;
     let time = 0;
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -301,14 +318,20 @@ LIVE_ORB_HTML = """
             body: JSON.stringify({ message: transcript })
           });
           const data = await res.json();
-          speakResponse(data.reply);
+          speechBox.innerText = data.reply;
+          
+          if (data.audio) {
+            playNeuralVoice(data.audio);
+          } else {
+            statusText.innerText = "Beklemede";
+          }
         } catch (e) {
           speechBox.innerText = "Bağlantıda sorun oldu anneciğim.";
           statusText.innerText = "Beklemede";
         }
       };
 
-      recognition.onerror = (e) => {
+      recognition.onerror = () => {
         statusText.innerText = "Beklemede";
         speechBox.innerText = "Sesini duyamadım, tekrar denemek için küreye dokun.";
         isListening = false;
@@ -320,40 +343,32 @@ LIVE_ORB_HTML = """
       };
     }
 
-    function speakResponse(text) {
-      if (!synth) return;
-      synth.cancel();
+    function playNeuralVoice(base64Audio) {
+      if (currentAudio) {
+        currentAudio.pause();
+      }
 
+      currentAudio = new Audio("data:audio/mp3;base64," + base64Audio);
       isSpeaking = true;
       statusText.innerText = "Katya Konuşuyor";
-      speechBox.innerText = text;
 
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = "tr-TR";
-      utterance.pitch = 1.15;
-      utterance.rate = 1.05;
-
-      const voices = synth.getVoices();
-      const trVoice = voices.find(v => v.lang.includes("tr") && (v.name.includes("Female") || v.name.includes("Kadın") || v.name.includes("Yelda") || v.name.includes("Filiz")));
-      if (trVoice) utterance.voice = trVoice;
-
-      utterance.onend = () => {
+      currentAudio.onended = () => {
         isSpeaking = false;
         statusText.innerText = "Beklemede";
         speechBox.innerText = "Konuşmak için tekrar dokun anneciğim.";
       };
 
-      utterance.onerror = () => {
+      currentAudio.onerror = () => {
         isSpeaking = false;
         statusText.innerText = "Beklemede";
       };
 
-      synth.speak(utterance);
+      currentAudio.play();
     }
 
     function toggleOrb() {
-      if (isSpeaking) {
-        synth.cancel();
+      if (isSpeaking && currentAudio) {
+        currentAudio.pause();
         isSpeaking = false;
         statusText.innerText = "Beklemede";
         return;
@@ -375,14 +390,14 @@ LIVE_ORB_HTML = """
       
       let energy = 0.2;
       if (isListening) energy = 0.5 + Math.sin(time * 5) * 0.2;
-      if (isSpeaking) energy = 0.8 + Math.sin(time * 8) * 0.3;
+      if (isSpeaking) energy = 0.85 + Math.sin(time * 8) * 0.35;
 
       const cx = width / 2;
       const cy = height / 2;
-      const r = 90 * (1 + energy * 0.3);
+      const r = 90 * (1 + energy * 0.35);
 
       const glow = ctx.createRadialGradient(cx, cy, r * 0.3, cx, cy, r * 2.2);
-      glow.addColorStop(0, isSpeaking ? "rgba(255, 0, 127, 0.5)" : "rgba(157, 0, 255, 0.4)");
+      glow.addColorStop(0, isSpeaking ? "rgba(255, 0, 127, 0.6)" : "rgba(157, 0, 255, 0.4)");
       glow.addColorStop(1, "rgba(6, 4, 10, 0)");
       ctx.fillStyle = glow;
       ctx.beginPath();
@@ -391,12 +406,12 @@ LIVE_ORB_HTML = """
 
       for (let layer = 0; layer < 3; layer++) {
         ctx.beginPath();
-        ctx.strokeStyle = layer % 2 === 0 ? "rgba(255, 45, 120, 0.7)" : "rgba(157, 0, 255, 0.7)";
+        ctx.strokeStyle = layer % 2 === 0 ? "rgba(255, 45, 120, 0.8)" : "rgba(157, 0, 255, 0.8)";
         ctx.lineWidth = 2.5;
         const pts = 60;
         for (let i = 0; i <= pts; i++) {
           const theta = (i / pts) * Math.PI * 2;
-          const wave = Math.sin(theta * 4 + time * 3 + layer) * (10 * energy);
+          const wave = Math.sin(theta * 4 + time * 3 + layer) * (12 * energy);
           const cr = r + wave - (layer * 10);
           const x = cx + Math.cos(theta) * cr;
           const y = cy + Math.sin(theta) * cr;
@@ -446,7 +461,6 @@ async def lifespan(app: FastAPI):
 
             await bot_app.initialize()
             await bot_app.start()
-            # Kısa bir bekleme ve polling başlatma
             await asyncio.sleep(1)
             await bot_app.updater.start_polling(drop_pending_updates=True)
             log_event("SYS", "Katya ve Canlı Mini App hazır!")
@@ -469,7 +483,8 @@ app = FastAPI(lifespan=lifespan)
 @app.post("/api/voice_chat")
 async def voice_chat_endpoint(payload: ChatPayload):
     reply = await execute_mother_order(payload.message)
-    return JSONResponse({"reply": reply})
+    audio_base64 = await text_to_speech_base64(reply)
+    return JSONResponse({"reply": reply, "audio": audio_base64})
 
 @app.get("/live", response_class=HTMLResponse)
 async def live_app():
