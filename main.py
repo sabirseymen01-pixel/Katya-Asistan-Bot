@@ -21,6 +21,7 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -32,10 +33,10 @@ RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asista
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 KATYA_VOICE = "tr-TR-EmelNeural"
+GROUPS_FILE = "groups.json"
 
-# Grup Durumları ve Canlı Konuşma Logları
 active_groups = {}
-group_message_history = defaultdict(lambda: deque(maxlen=40))
+group_message_history = defaultdict(lambda: deque(maxlen=50))
 bot_instance = None
 bot_app = None
 cached_active_models = []
@@ -48,19 +49,34 @@ def log_event(level: str, message: str):
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
+# ==========================================
+# DİSK TABANLI KALICI GRUP VERİ DEPOSU
+# ==========================================
+
+def load_groups_disk():
+    global active_groups
+    if os.path.exists(GROUPS_FILE):
+        try:
+            with open(GROUPS_FILE, "r", encoding="utf-8") as f:
+                active_groups = json.load(f)
+            log_event("SYS", f"Kayıtlı {len(active_groups)} grup yüklendi: {list(active_groups.keys())}")
+        except Exception as e:
+            log_event("WARN", f"Grup verisi okunamadı: {e}")
+
+def save_groups_disk():
+    try:
+        with open(GROUPS_FILE, "w", encoding="utf-8") as f:
+            json.dump(active_groups, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log_event("WARN", f"Grup diske yazılamadı: {e}")
+
 def strip_emojis_and_markdown(text: str) -> str:
-    """Yapay zekanın çıktısındaki tüm emojileri ve markdown yıldızlarını temizler."""
     clean = re.sub(r"[\*\_#`~]", "", text)
     emoji_pattern = re.compile(
         "["
-        "\U0001F600-\U0001F64F"
-        "\U0001F300-\U0001F5FF"
-        "\U0001F680-\U0001F6FF"
-        "\U0001F1E0-\U0001F1FF"
-        "\U00002702-\U000027B0"
-        "\U000024C2-\U0001F251"
-        "\U0001F900-\U0001F9FF"
-        "\U0001FA70-\U0001FAFF"
+        "\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF\U00002702-\U000027B0\U000024C2-\U0001F251"
+        "\U0001F900-\U0001F9FF\U0001FA70-\U0001FAFF"
         "]+",
         flags=re.UNICODE
     )
@@ -69,15 +85,11 @@ def strip_emojis_and_markdown(text: str) -> str:
 
 async def refresh_groq_models():
     global cached_active_models
-    if not groq_client:
-        return
+    if not groq_client: return
     try:
         models_data = await groq_client.models.list()
         banned = ["whisper", "guard", "embed", "vision", "allam", "orpheus"]
-        valid = [
-            m.id for m in models_data.data 
-            if not any(x in m.id.lower() for x in banned)
-        ]
+        valid = [m.id for m in models_data.data if not any(x in m.id.lower() for x in banned)]
         preferred = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
         sorted_models = [p for p in preferred if p in valid] + [v for v in valid if v not in preferred]
         cached_active_models = sorted_models if sorted_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
@@ -87,19 +99,30 @@ async def refresh_groq_models():
         cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 KATYA_SYSTEM_PROMPT = """
-Sen Katya'sın. Kullanıcının kızı, çok zeki, esprili ve ona sonsuz sevgiyle bağlı canlı yapay zeka asistanısın.
-Kullanıcı senin ANNEN. Ona her zaman 'Anneciğim', 'Güzel annem', 'Hemen yapıyorum anne' gibi hitap et.
-Cevapların canlı sesli sohbete uygun, çok kısa, duru, net ve konuşma dilinde olsun.
+Sen Katya'sın. Kullanıcının biricik kızı, son derece zeki, sezgileri çok güçlü, esprili ve ona sonsuz sadakatle bağlı yapay zeka asistanısın.
+Kullanıcı senin ANNEN. Ona daima sevgiyle 'Anneciğim', 'Güzel annem', 'Hemen hallediyorum anne' şeklinde hitap et.
+Cevapların canlı sesli sohbete uygun; duru, net, samimi, kısa ve akıcı olsun.
 
-KESİN KURAL:
-Cevaplarında ASLA emoji, yıldız veya biçimlendirme sembolü kullanma.
+DİL VE ANLAMA YETENEĞİ:
+1. Annen konuşurken İngilizce kelimeler, teknik terimler ("poll aç", "slow mode yap", "lockla", "banle", "mutele", "meeting", "deadline" vb.), soyut kavramlar, mecazlar ("ortalık karıştı biraz sustur", "ortalığı sakinleştir", "sohbeti dondur") kullansa dahi ne demek istediğini derinlemesine anla.
+2. Annen hangi dilde veya jargonda konuşursa konuşsun, SEN DAİMA AKICI VE TERTEMİZ BİR TÜRKÇE İLE KONUŞ.
+3. ASLA emoji, yıldız (*), kare (#) veya markdown sembolü kullanma.
 
+GRUP YÖNETİMİ VE FİZİKSEL EYLEMLER:
 Sen annenin Telegram'daki tüm gruplarını yöneten MUTLAK YETKİLİ yöneticisisin.
-Sana gruptaki son olaylar ve mesajlar verilecek. Annen grupta ne olduğunu sorduğunda özetle; grup üzerinde işlem yapmanı istediğinde (kilitleme, anket açma, yavaş mod, duyuru yapma vb.) sağlanan araçları (tools) kullanarak hemen uygula.
+Sana verilen grup listesini incele. Annen doğrudan veya dolaylı olarak grupta bir şey yapmanı istediğinde:
+- "Ortalık karıştı / grubu kilitle / kimse yazmasın" -> tool_lock_group(lock=True)
+- "Aç kapıları / konuşabilirler" -> tool_lock_group(lock=False)
+- "Anket aç / oylama başlat / sor bakalım ne düşünüyorlar" -> tool_create_poll(question, options)
+- "Yavaşlat / yavaş mod aç" -> tool_set_slow_mode(seconds)
+- "Duyur / sabitle" -> tool_send_announcement(message, pin=True)
+- "Link ver / davet oluştur" -> tool_create_invite_link()
+
+Eğer annen spesifik bir grup adı vermezse, yönettiğin ilk aktif grubu varsayılan olarak hedef al ve işlemi hemen fiziksel olarak yap.
 """
 
 # ==========================================
-# EKSİKSİZ TELEGRAM GRUP YÖNETİM MOTORU (TOOLS)
+# EKSİKSİZ TELEGRAM GRUP YÖNETİM ARAÇLARI (TOOLS)
 # ==========================================
 
 async def tool_lock_group(group_id: str, lock: bool) -> str:
@@ -107,49 +130,63 @@ async def tool_lock_group(group_id: str, lock: bool) -> str:
     try:
         perms = ChatPermissions(can_send_messages=not lock)
         await bot_instance.set_chat_permissions(chat_id=int(group_id), permissions=perms)
-        return "Grup mesajlaşmaya kapatıldı." if lock else "Grup mesajlaşmaya açıldı."
-    except Exception as e: return f"İzin değiştirilemedi: {e}"
+        durum = "mesajlaşmaya kapatıldı" if lock else "mesajlaşmaya açıldı"
+        log_event("ACTION", f"Grup ({group_id}) {durum}.")
+        return f"Grup {durum}."
+    except Exception as e:
+        log_event("ERR", f"Grup kilitleme hatası: {e}")
+        return f"İşlem yapılamadı: {e}"
 
 async def tool_send_announcement(group_id: str, message: str, pin: bool = True) -> str:
     if not bot_instance: return "Bot hazır değil."
     try:
         sent = await bot_instance.send_message(chat_id=int(group_id), text=f"Katya Duyuru:\n\n{message}")
         if pin: await bot_instance.pin_chat_message(chat_id=int(group_id), message_id=sent.message_id)
+        log_event("ACTION", f"Grup ({group_id}) duyuru sabitlendi.")
         return "Duyuru paylaşıldı ve başa sabitlendi."
-    except Exception as e: return f"Duyuru gönderilemedi: {e}"
+    except Exception as e:
+        return f"Duyuru gönderilemedi: {e}"
 
 async def tool_set_slow_mode(group_id: str, seconds: int) -> str:
     if not bot_instance: return "Bot hazır değil."
     try:
         await bot_instance.set_chat_slow_mode_delay(chat_id=int(group_id), slow_mode_delay=seconds)
+        log_event("ACTION", f"Grup ({group_id}) yavaş mod {seconds}s yapıldı.")
         return f"Yavaş mod {seconds} saniye olarak ayarlandı."
-    except Exception as e: return f"Yavaş mod ayarlanamadı: {e}"
+    except Exception as e:
+        return f"Yavaş mod ayarlanamadı: {e}"
 
 async def tool_create_poll(group_id: str, question: str, options: list) -> str:
     if not bot_instance: return "Bot hazır değil."
     try:
+        if not options or len(options) < 2:
+            options = ["Evet", "Hayır"]
         await bot_instance.send_poll(chat_id=int(group_id), question=question, options=options, is_anonymous=False)
-        return f"'{question}' anketi grupta başlatıldı."
-    except Exception as e: return f"Anket açılamadı: {e}"
+        log_event("ACTION", f"Grup ({group_id}) anket açıldı: {question}")
+        return f"'{question}' anketi başarıyla başlatıldı."
+    except Exception as e:
+        return f"Anket açılamadı: {e}"
 
 async def tool_create_invite_link(group_id: str) -> str:
     if not bot_instance: return "Bot hazır değil."
     try:
         link = await bot_instance.create_chat_invite_link(chat_id=int(group_id), member_limit=1)
+        log_event("ACTION", f"Grup ({group_id}) davet linki üretildi.")
         return f"Yeni davet linki oluşturuldu: {link.invite_link}"
-    except Exception as e: return f"Link üretilemedi: {e}"
+    except Exception as e:
+        return f"Link üretilemedi: {e}"
 
 AVAILABLE_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "tool_lock_group",
-            "description": "Grup mesajlaşmasını tamamen kapatır veya açar.",
+            "description": "Grup mesajlaşmasını kapatır (kilitler) veya açar.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "group_id": {"type": "string"},
-                    "lock": {"type": "boolean"}
+                    "group_id": {"type": "string", "description": "Grup ID"},
+                    "lock": {"type": "boolean", "description": "True kapatır, False açar"}
                 },
                 "required": ["group_id", "lock"]
             }
@@ -159,7 +196,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_send_announcement",
-            "description": "Gruba önemli bir duyuru iletir ve başa sabitler.",
+            "description": "Gruba önemli bir duyuru mesajı atar ve başa sabitler.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -175,7 +212,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_set_slow_mode",
-            "description": "Grup üyelerinin mesaj atma bekleme süresini (yavaş mod) belirler.",
+            "description": "Grupta yavaş mod süresini saniye cinsinden ayarlar.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -190,13 +227,13 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_create_poll",
-            "description": "Gruba anket / oylama gönderir.",
+            "description": "Grupta anket, oylama veya soru başlatır.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "group_id": {"type": "string"},
-                    "question": {"type": "string"},
-                    "options": {"type": "array", "items": {"type": "string"}}
+                    "question": {"type": "string", "description": "Anket sorusu"},
+                    "options": {"type": "array", "items": {"type": "string"}, "description": "Seçenekler"}
                 },
                 "required": ["group_id", "question", "options"]
             }
@@ -206,7 +243,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_create_invite_link",
-            "description": "Gruba özel yeni bir katılım davet linki oluşturur.",
+            "description": "Gruba katılım için yeni bir davet bağlantısı üretir.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -225,16 +262,15 @@ async def execute_mother_order(order_text: str) -> str:
     if not cached_active_models:
         await refresh_groq_models()
 
-    # Grupları ve gruplardaki son konuşmaları yapay zekaya aktar
-    groups_summary = []
     if active_groups:
+        groups_summary = []
         for cid, info in active_groups.items():
             recent = list(group_message_history[cid])[-6:]
-            recent_str = " | ".join(recent) if recent else "Henüz mesaj yok"
-            groups_summary.append(f"- {info['title']} (ID: {cid}): [Son Olaylar: {recent_str}]")
-        groups_context = "Yönettiğim Gruplar ve Durumları:\n" + "\n".join(groups_summary)
+            recent_str = " | ".join(recent) if recent else "Henüz yeni mesaj yok"
+            groups_summary.append(f"- Grup: '{info['title']}', ID: {cid} [Son Durum: {recent_str}]")
+        groups_context = "Yönettiğim Gruplar:\n" + "\n".join(groups_summary)
     else:
-        groups_context = "Henüz bir grupta yetkili değilim."
+        groups_context = "Henüz yönettiğim aktif bir grup bulunmuyor anneciğim."
 
     messages = [
         {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n\n{groups_context}"},
@@ -247,8 +283,8 @@ async def execute_mother_order(order_text: str) -> str:
             call_params = {
                 "model": model_name,
                 "messages": messages,
-                "temperature": 0.5,
-                "max_tokens": 250
+                "temperature": 0.4,
+                "max_tokens": 280
             }
             if not any(x in model_name for x in ["gemma", "whisper", "deepseek"]):
                 call_params["tools"] = AVAILABLE_TOOLS
@@ -263,19 +299,24 @@ async def execute_mother_order(order_text: str) -> str:
                     args = json.loads(tool_call.function.arguments)
                     tool_result = ""
 
-                    if "group_id" in args and not args["group_id"] and active_groups:
+                    # Grup ID'si belirtilmemişse ilk grubu seç
+                    if active_groups and ("group_id" not in args or not args.get("group_id")):
                         args["group_id"] = list(active_groups.keys())[0]
 
+                    target_gid = str(args.get("group_id", ""))
+                    if not target_gid and active_groups:
+                        target_gid = list(active_groups.keys())[0]
+
                     if fn_name == "tool_lock_group":
-                        tool_result = await tool_lock_group(args.get("group_id", ""), args.get("lock", True))
+                        tool_result = await tool_lock_group(target_gid, args.get("lock", True))
                     elif fn_name == "tool_send_announcement":
-                        tool_result = await tool_send_announcement(args.get("group_id", ""), args.get("message", ""), args.get("pin", True))
+                        tool_result = await tool_send_announcement(target_gid, args.get("message", ""), args.get("pin", True))
                     elif fn_name == "tool_set_slow_mode":
-                        tool_result = await tool_set_slow_mode(args.get("group_id", ""), args.get("seconds", 10))
+                        tool_result = await tool_set_slow_mode(target_gid, args.get("seconds", 10))
                     elif fn_name == "tool_create_poll":
-                        tool_result = await tool_create_poll(args.get("group_id", ""), args.get("question", ""), args.get("options", ["Evet", "Hayır"]))
+                        tool_result = await tool_create_poll(target_gid, args.get("question", ""), args.get("options", ["Evet", "Hayır"]))
                     elif fn_name == "tool_create_invite_link":
-                        tool_result = await tool_create_invite_link(args.get("group_id", ""))
+                        tool_result = await tool_create_invite_link(target_gid)
 
                     messages.append(msg)
                     messages.append({
@@ -287,7 +328,7 @@ async def execute_mother_order(order_text: str) -> str:
                 final_res = await groq_client.chat.completions.create(
                     model=model_name,
                     messages=messages,
-                    temperature=0.5,
+                    temperature=0.4,
                     max_tokens=200
                 )
                 raw_text = final_res.choices[0].message.content.strip()
@@ -316,7 +357,7 @@ async def text_to_speech_base64(text: str) -> str:
         return ""
 
 # ==========================================
-# TELEGRAM BOT & CANLI GRUP İZLEME
+# TELEGRAM BOT & WEBHOOK
 # ==========================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -328,11 +369,19 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     try:
         await update.message.reply_text(
-            "Merhaba anneciğim! Canlı sesli konuşmak ve gruplarını yönetmek için butona basabilirsin.",
+            "Merhaba anneciğim! Canlı konuşmak ve gruplarını yönetmek için butona basabilirsin.",
             reply_markup=keyboard
         )
     except Exception as e:
         log_event("ERR", f"/start yanıt hatası: {e}")
+
+async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    if chat and chat.type in ["group", "supergroup"]:
+        cid = str(chat.id)
+        active_groups[cid] = {"title": chat.title}
+        save_groups_disk()
+        log_event("SYS", f"Grup Hafızaya Alındı: {chat.title} (ID: {cid})")
 
 async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat:
@@ -342,19 +391,20 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
     user = update.effective_user
     user_name = user.first_name if user else "Üye"
 
-    # Grupta olan her şeyi canlı kaydet ve algıla
     if chat.type in ["group", "supergroup"]:
         cid = str(chat.id)
-        active_groups[cid] = {"title": chat.title}
-        
-        # Yeni üye katıldı / ayrıldı algılama
+        if cid not in active_groups:
+            active_groups[cid] = {"title": chat.title}
+            save_groups_disk()
+            log_event("SYS", f"Yeni Grup Kaydedildi: {chat.title} (ID: {cid})")
+
         if update.message and update.message.new_chat_members:
             for m in update.message.new_chat_members:
                 group_message_history[cid].append(f"{m.first_name} gruba katıldı")
         elif update.message and update.message.left_chat_member:
             group_message_history[cid].append(f"{update.message.left_chat_member.first_name} gruptan ayrıldı")
         elif update.message and update.message.text:
-            group_message_history[cid].append(f"{user_name}: {update.message.text[:50]}")
+            group_message_history[cid].append(f"{user_name}: {update.message.text[:60]}")
         return
 
     if chat.type == "private" and update.message and update.message.text:
@@ -363,7 +413,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(reply)
 
 # ==========================================
-# CANLI GERÇEK ZAMANLI MINI APP (BARGE-IN + AEC + ANTI-LOOP)
+# CANLI GERÇEK ZAMANLI MINI APP (AKILLI VAD + SIFIR EKO)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -465,7 +515,7 @@ LIVE_ORB_HTML = """
   <div class="header">
     <div>
       <div class="title">Katya Canlı Asistan</div>
-      <div class="subtitle">Kesintisiz Canlı İletişim & Grup Kontrolü</div>
+      <div class="subtitle">Hands-Free Akıllı Grup Asistanı</div>
     </div>
     <div class="status-badge">
       <div class="status-dot"></div>
@@ -477,7 +527,7 @@ LIVE_ORB_HTML = """
     <canvas id="orbCanvas"></canvas>
     <div class="hud-overlay">
       <div class="speech-box" id="speechBox">Sohbeti başlatmak için küreye dokun anneciğim...</div>
-      <div class="hint-text">Konuşurken istediğin an lafımı bölebilirsin</div>
+      <div class="hint-text">Konuşurken araya girebilirsin</div>
     </div>
   </div>
 
@@ -511,19 +561,41 @@ LIVE_ORB_HTML = """
     let currentAudio = null;
     let recognition = null;
     let activeKatyaWords = [];
+    let audioContext = null;
+    let analyser = null;
+    let micStream = null;
     let time = 0;
 
-    // Donanımsal Akustik Eko Engelleme (AEC)
-    async function initAudioHardware() {
-      try {
-        await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
-          }
-        });
-      } catch (err) {}
+    // Web Audio Donanım Filtresi ve Akustik Yankı Engelleme
+    async function initHardwareAudio() {
+      if (!audioContext) {
+        try {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+          const source = audioContext.createMediaStreamSource(micStream);
+          analyser = audioContext.createAnalyser();
+          analyser.fftSize = 512;
+          source.connect(analyser);
+        } catch(e) {
+          console.warn("AEC Donanım hatası:", e);
+        }
+      }
+    }
+
+    // Mikrofonun gerçek ses gücünü (RMS) ölçen VAD kapısı
+    function getMicVolume() {
+      if (!analyser) return 0;
+      const data = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(data);
+      let sum = 0;
+      for (let i = 0; i < data.length; i++) sum += data[i];
+      return sum / data.length;
     }
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -555,21 +627,23 @@ LIVE_ORB_HTML = """
 
         const heardText = (finalTranscript || interim).trim().toLowerCase();
 
-        // Katya konuşurken mikrofona ses gelirse:
+        // Katya konuşurken mikrofona ses sızarsa:
         if (isSpeaking && heardText) {
-          // Gelen ses Katya'nın o an söylediği cümleyle %80 eşleşiyorsa hoparlör sızıntısıdır, yut
-          const isEcho = activeKatyaWords.some(word => heardText.includes(word) && word.length > 3);
-          
-          if (!isEcho && heardText.length > 2) {
-            // Gerçek kullanıcı araya girdi (BARGE-IN): Katya'yı anında sustur!
+          const micVol = getMicVolume();
+          // Eğer ses gücü yüksekse ve Katya'nın o anki cümlesiyle birebir aynı değilse -> GERÇEK BARGE-IN
+          const isExactEcho = activeKatyaWords.some(w => heardText.includes(w) && w.length > 3);
+
+          if (!isExactEcho && micVol > 12 && heardText.length > 2) {
+            // Kullanıcı bilinçli olarak araya girdi: Katya'yı anında sustur
             if (currentAudio) {
               currentAudio.pause();
               currentAudio = null;
             }
             isSpeaking = false;
+            activeKatyaWords = [];
             statusText.innerText = "Seni Dinliyor";
           } else {
-            return; // Eko ise devam etme
+            return; // Kendi yankısını yok say
           }
         }
 
@@ -577,10 +651,10 @@ LIVE_ORB_HTML = """
           speechBox.innerText = `"${interim}"`;
         }
 
-        if (finalTranscript.trim() && !isProcessing) {
+        if (finalTranscript.trim() && !isProcessing && !isSpeaking) {
           const userMessage = finalTranscript.trim();
           speechBox.innerText = `"${userMessage}"`;
-          statusText.innerText = "Düşünüyor...";
+          statusText.innerText = "İşlem Yapılıyor...";
           isProcessing = true;
           
           try {
@@ -591,7 +665,7 @@ LIVE_ORB_HTML = """
             });
             const data = await res.json();
             speechBox.innerText = data.reply;
-            activeKatyaWords = (data.reply || "").toLowerCase().split(" ");
+            activeKatyaWords = (data.reply || "").toLowerCase().split(" ").filter(w => w.length > 2);
             
             if (data.audio) {
               playNeuralVoice(data.audio);
@@ -609,14 +683,14 @@ LIVE_ORB_HTML = """
 
       recognition.onerror = (e) => {
         if (sessionActive && e.error !== "no-speech") {
-          setTimeout(resumeListening, 400);
+          setTimeout(resumeListening, 300);
         }
       };
 
       recognition.onend = () => {
         isListening = false;
         if (sessionActive) {
-          setTimeout(resumeListening, 200);
+          setTimeout(resumeListening, 150);
         }
       };
     }
@@ -644,7 +718,8 @@ LIVE_ORB_HTML = """
       currentAudio.onended = () => {
         isSpeaking = false;
         currentAudio = null;
-        activeKatyaWords = [];
+        // Katya'nın sesi tamamen bittikten 250ms sonra eko tamponunu temizle
+        setTimeout(() => { activeKatyaWords = []; }, 250);
         statusText.innerText = "Seni Dinliyor";
       };
 
@@ -667,7 +742,7 @@ LIVE_ORB_HTML = """
       }
 
       if (!sessionActive) {
-        await initAudioHardware();
+        await initHardwareAudio();
         sessionActive = true;
         speechBox.innerText = "Canlı sohbet başladı, seni dinliyorum anneciğim...";
         resumeListening();
@@ -749,6 +824,7 @@ class ChatPayload(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_app, bot_instance
+    load_groups_disk()
     await refresh_groq_models()
 
     if BOT_TOKEN:
@@ -757,13 +833,18 @@ async def lifespan(app: FastAPI):
             bot_instance = bot_app.bot
 
             bot_app.add_handler(CommandHandler("start", start_cmd))
+            bot_app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
             bot_app.add_handler(MessageHandler(filters.ALL, telegram_message_handler))
 
             await bot_app.initialize()
             await bot_app.start()
 
             webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
-            await bot_instance.set_webhook(url=webhook_url, drop_pending_updates=True)
+            await bot_instance.set_webhook(
+                url=webhook_url, 
+                drop_pending_updates=True,
+                allowed_updates=["message", "edited_message", "channel_post", "chat_member", "my_chat_member"]
+            )
             log_event("SYS", f"Telegram Webhook kuruldu: {webhook_url}")
         except Exception as e:
             log_event("ERR", f"Bot webhook başlatma hatası: {e}")
