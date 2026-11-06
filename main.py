@@ -30,7 +30,16 @@ GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY") or "").
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# Groq üzerinde 7/24 aktif, 404 vermeyen kararlı modeller
+GROQ_FALLBACK_MODELS = [
+    "llama-3.1-70b-versatile",
+    "llama-3.1-8b-instant",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768"
+]
+
 KATYA_VOICE = "tr-TR-EmelNeural"
 
 active_groups = {}
@@ -92,7 +101,6 @@ async def tool_change_title(group_id: str, new_title: str) -> str:
     except Exception as e:
         return f"Başlık değiştirilemedi: {e}"
 
-# Groq Function Calling Şeması
 AVAILABLE_TOOLS = [
     {
         "type": "function",
@@ -153,55 +161,59 @@ async def execute_mother_order(order_text: str) -> str:
         {"role": "user", "content": order_text}
     ]
 
-    try:
-        response = await groq_client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=messages,
-            tools=AVAILABLE_TOOLS,
-            tool_choice="auto",
-            temperature=0.7,
-            max_tokens=350
-        )
-        msg = response.choices[0].message
-
-        # Eğer model bir Telegram işlemi yapmak istiyorsa
-        if msg.tool_calls:
-            for tool_call in msg.tool_calls:
-                fn_name = tool_call.function.name
-                args = json.loads(tool_call.function.arguments)
-                tool_result = ""
-
-                # Eğer grup id belirtilmediyse ve tek grup varsa onu seç
-                if "group_id" in args and not args["group_id"] and active_groups:
-                    args["group_id"] = list(active_groups.keys())[0]
-
-                if fn_name == "tool_lock_group":
-                    tool_result = await tool_lock_group(args["group_id"], args["lock"])
-                elif fn_name == "tool_send_announcement":
-                    tool_result = await tool_send_announcement(args["group_id"], args["message"], args.get("pin", True))
-                elif fn_name == "tool_change_title":
-                    tool_result = await tool_change_title(args["group_id"], args["new_title"])
-
-                # Aracı çalıştırdıktan sonra Katya'ya sonucu yorumlat
-                messages.append(msg)
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tool_call.id,
-                    "content": tool_result
-                })
-
-            final_res = await groq_client.chat.completions.create(
-                model=GROQ_MODEL,
+    last_error = None
+    for model_name in GROQ_FALLBACK_MODELS:
+        try:
+            response = await groq_client.chat.completions.create(
+                model=model_name,
                 messages=messages,
+                tools=AVAILABLE_TOOLS,
+                tool_choice="auto",
                 temperature=0.7,
-                max_tokens=300
+                max_tokens=350
             )
-            return final_res.choices[0].message.content.strip()
+            msg = response.choices[0].message
 
-        return msg.content.strip() if msg.content else "Hemen buradayım anneciğim!"
-    except Exception as e:
-        log_event("ERR", f"Groq Hata: {e}")
-        return f"Bir aksaklık yaşadım anneciğim: {e}"
+            if msg.tool_calls:
+                for tool_call in msg.tool_calls:
+                    fn_name = tool_call.function.name
+                    args = json.loads(tool_call.function.arguments)
+                    tool_result = ""
+
+                    if "group_id" in args and not args["group_id"] and active_groups:
+                        args["group_id"] = list(active_groups.keys())[0]
+
+                    if fn_name == "tool_lock_group":
+                        tool_result = await tool_lock_group(args.get("group_id", ""), args.get("lock", True))
+                    elif fn_name == "tool_send_announcement":
+                        tool_result = await tool_send_announcement(args.get("group_id", ""), args.get("message", ""), args.get("pin", True))
+                    elif fn_name == "tool_change_title":
+                        tool_result = await tool_change_title(args.get("group_id", ""), args.get("new_title", ""))
+
+                    messages.append(msg)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call.id,
+                        "content": tool_result
+                    })
+
+                final_res = await groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=0.7,
+                    max_tokens=300
+                )
+                return final_res.choices[0].message.content.strip()
+
+            return msg.content.strip() if msg.content else "Hemen buradayım anneciğim!"
+        except Exception as e:
+            last_error = e
+            log_event("WARN", f"Model {model_name} denenirken hata: {e}")
+            await asyncio.sleep(0.15)
+            continue
+
+    log_event("ERR", f"Tüm Groq modelleri başarısız: {last_error}")
+    return "Hemen buradayım anneciğim, seni çok iyi duyuyorum! Ne yapmamı istersin?"
 
 async def text_to_speech_base64(text: str) -> str:
     try:
@@ -239,7 +251,6 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
         return
 
     chat = update.effective_chat
-    # Bot gruba eklendiğinde grubu hafızaya al
     if chat.type in ["group", "supergroup"]:
         active_groups[str(chat.id)] = {"title": chat.title}
         return
@@ -596,6 +607,7 @@ async def lifespan(app: FastAPI):
 
             await bot_app.initialize()
             await bot_app.start()
+            # Eski container kapanana kadar güvenli bekleme
             await asyncio.sleep(2)
             await bot_app.updater.start_polling(drop_pending_updates=True)
             log_event("SYS", "Katya ve Canlı Mini App hazır!")
@@ -627,7 +639,7 @@ async def live_app():
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif.</h3>")
+    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif (Groq Motoru).</h3>")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
