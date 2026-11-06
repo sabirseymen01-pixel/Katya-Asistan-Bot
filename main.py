@@ -36,7 +36,7 @@ KATYA_VOICE = "tr-TR-EmelNeural"
 GROUPS_FILE = "groups.json"
 
 active_groups = {}
-chat_context_log = deque(maxlen=60) # Hem özel mesajlar hem grup mesajları
+chat_context_log = deque(maxlen=60)
 bot_instance = None
 bot_app = None
 cached_active_models = []
@@ -49,17 +49,13 @@ def log_event(level: str, message: str):
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
-# ==========================================
-# KALICI DİSK DEPOSU
-# ==========================================
-
 def load_groups_disk():
     global active_groups
     if os.path.exists(GROUPS_FILE):
         try:
             with open(GROUPS_FILE, "r", encoding="utf-8") as f:
                 active_groups = json.load(f)
-            log_event("SYS", f"Diskten {len(active_groups)} grup yüklendi.")
+            log_event("SYS", f"Diskten {len(active_groups)} grup yüklendi: {list(active_groups.keys())}")
         except Exception as e:
             log_event("WARN", f"Grup verisi okunamadı: {e}")
 
@@ -97,16 +93,16 @@ async def refresh_groq_models():
         cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 KATYA_SYSTEM_PROMPT = """
-Sen Katya'sın. Kullanıcının akıllı, sadık kızı ve Telegram grup yöneticisisin.
-Kullanıcı senin ANNEN. Ona saygı ve sevgiyle 'Anneciğim' diye hitap et.
+Sen Katya'sın. Kullanıcının akıllı, sadık kızı ve mutlak yetkili Telegram grup yöneticisisin.
+Kullanıcı senin ANNEN. Ona daima sevgiyle 'Anneciğim' diye hitap et.
 
-KESİN KONUŞMA KURALLARI:
+KESİN KURALLAR:
 1. GEREKSİZ KONUŞMA, LAFI UZATMA. Sadece yapılan işlemi bildir veya soruya net, kısa, tek cümlelik yanıt ver.
 2. Emojiler, semboller, markdown yıldızları (*) KESİNLİKLE YASAKTIR.
-3. Annen İngilizce, argo, mecaz, soyut terimler ("poll aç", "lockla", "mutele", "ortalığı sakinleştir") kullansa bile kusursuz anla ve DAİMA duru Türkçe cevap ver.
+3. Annen İngilizce, teknik terimler, soyut veya mecaz ("poll aç", "lockla", "mutele", "ortalığı sakinleştir", "kapıları kapat") kullansa bile anında anla ve Türkçe kısa yanıt ver.
 
-YETKİ VE FİZİKSEL EYLEMLER:
-Sana sunulan araçları (tools) kullanarak grupları hemen yönet. Eğer annen grup adı belirtmediyse listedeki grubu otomatik seçip işlemi uygula.
+YÖNETİM:
+Sana verilen listede grup varsa o grupta hemen işlem yap. Grup belirtilmediyse kayıtlı grubu otomatik hedef al.
 """
 
 # ==========================================
@@ -245,11 +241,10 @@ async def execute_mother_order(order_text: str) -> str:
     if not cached_active_models:
         await refresh_groq_models()
 
-    # Grupları ve son yazışmaları aktar
     groups_list_str = "\n".join([f"- {info['title']} (ID: {cid})" for cid, info in active_groups.items()]) if active_groups else "Kayıtlı aktif grup yok."
     recent_events_str = "\n".join(list(chat_context_log)[-8:]) if chat_context_log else "Yeni olay yok."
 
-    context_str = f"Yönetilen Gruplar:\n{groups_list_str}\n\nSon Olay ve Sohbet Akışı:\n{recent_events_str}"
+    context_str = f"Yönetilen Gruplar:\n{groups_list_str}\n\nSon Olaylar:\n{recent_events_str}"
 
     messages = [
         {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n\n{context_str}"},
@@ -261,8 +256,8 @@ async def execute_mother_order(order_text: str) -> str:
             call_params = {
                 "model": model_name,
                 "messages": messages,
-                "temperature": 0.3, # Net ve kısa yanıtlar için düşürüldü
-                "max_tokens": 150   # Laf kalabalığını engellemek için sınırlandı
+                "temperature": 0.3,
+                "max_tokens": 150
             }
             if not any(x in model_name for x in ["gemma", "whisper", "deepseek"]):
                 call_params["tools"] = AVAILABLE_TOOLS
@@ -323,7 +318,7 @@ async def text_to_speech_base64(text: str) -> str:
         return ""
 
 # ==========================================
-# TELEGRAM BOT & DİNAMİK MESAJ ALICISI
+# TELEGRAM BOT & DİNAMİK GRUP TETİKLEYİCİLERİ
 # ==========================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -341,13 +336,25 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         pass
 
+async def bind_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Grupta /bagla veya /katya yazıldığında grubu anında hafızaya kilitler."""
+    chat = update.effective_chat
+    if chat and chat.type in ["group", "supergroup"]:
+        cid = str(chat.id)
+        active_groups[cid] = {"title": chat.title}
+        save_groups_disk()
+        log_event("SYS", f"Grup Manuel Olarak Bağlandı: {chat.title} ({cid})")
+        await update.message.reply_text(f"Bu grubu başarıyla hafızama kaydettim anneciğim: {chat.title}")
+    else:
+        await update.message.reply_text("Bu komutu yönetmemi istediğin grupta yazmalısın anneciğim.")
+
 async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     if chat and chat.type in ["group", "supergroup"]:
         cid = str(chat.id)
         active_groups[cid] = {"title": chat.title}
         save_groups_disk()
-        log_event("SYS", f"Grup Kaydedildi: {chat.title} ({cid})")
+        log_event("SYS", f"Grup Otomatik Algılandı: {chat.title} ({cid})")
 
 async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat:
@@ -358,25 +365,25 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
     user_name = user.first_name if user else "Biri"
     text = update.message.text if update.message and update.message.text else ""
 
-    # 1. Grupta atılan mesajlar
+    # Grupta atılan her mesajda grubu belleğe al
     if chat.type in ["group", "supergroup"]:
         cid = str(chat.id)
         if cid not in active_groups:
             active_groups[cid] = {"title": chat.title}
             save_groups_disk()
+            log_event("SYS", f"Grup Mesajından Kaydedildi: {chat.title} ({cid})")
         if text:
             chat_context_log.append(f"[{chat.title}] {user_name}: {text[:60]}")
         return
 
-    # 2. Botun özel sohbetine atılan mesajlar (Özel mesajları da hafızaya kaydet)
     if chat.type == "private" and text:
-        chat_context_log.append(f"[Özel Mesaj] {user_name}: {text[:60]}")
-        log_event("MSG", f"Özel Mesaj Alındı: {text}")
+        chat_context_log.append(f"[Özel] {user_name}: {text[:60]}")
+        log_event("MSG", f"Özel Mesaj: {text}")
         reply = await execute_mother_order(text)
         await update.message.reply_text(reply)
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ (SIFIR EKO, KESİNTİSİZ)
+# CANLI MINI APP
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -534,10 +541,7 @@ LIVE_ORB_HTML = """
       };
 
       recognition.onresult = async (event) => {
-        // Katya konuşurken veya işlem yapılırken KESİNLİKLE ses işlenmez (Kendi sesini duyma imkansız)
-        if (isSpeaking || isProcessing) {
-          return;
-        }
+        if (isSpeaking || isProcessing) return;
 
         let interim = "";
         let finalTranscript = "";
@@ -610,7 +614,6 @@ LIVE_ORB_HTML = """
       isSpeaking = false;
       isProcessing = false;
       currentAudio = null;
-      // Katya'nın sesi bittikten 350 milisaniye sonra dinlemeyi aç
       setTimeout(resumeListening, 350);
     }
 
@@ -625,7 +628,6 @@ LIVE_ORB_HTML = """
       isProcessing = false;
       statusText.innerText = "Katya Konuşuyor";
 
-      // Ses çalarken mikrofonu zorla durdur
       try { recognition.stop(); } catch(e) {}
 
       currentAudio.onended = () => {
@@ -737,6 +739,9 @@ async def lifespan(app: FastAPI):
             bot_instance = bot_app.bot
 
             bot_app.add_handler(CommandHandler("start", start_cmd))
+            # Manuel bağlama komutları
+            bot_app.add_handler(CommandHandler("bagla", bind_group_cmd))
+            bot_app.add_handler(CommandHandler("katya", bind_group_cmd))
             bot_app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
             bot_app.add_handler(MessageHandler(filters.ALL, telegram_message_handler))
 
@@ -744,10 +749,10 @@ async def lifespan(app: FastAPI):
             await bot_app.start()
 
             webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
+            # Filtresiz tam webhook: Telegram'daki tüm güncellemeleri koşulsuz al
             await bot_instance.set_webhook(
                 url=webhook_url, 
-                drop_pending_updates=True,
-                allowed_updates=["message", "edited_message", "channel_post", "chat_member", "my_chat_member"]
+                drop_pending_updates=True
             )
             log_event("SYS", f"Telegram Webhook kuruldu: {webhook_url}")
         except Exception as e:
