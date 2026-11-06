@@ -31,9 +31,11 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
-GEMINI_MODEL = "gemini-3.8-flash"
-# Türkçe Doğal Kadın Sesi (Emel veya Dilara)
-KATYA_VOICE = "tr-TR-EmelNeural" 
+# 503 yoğunluk hatasında sırayla denenecek güncel modeller
+FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
+
+# Doğal Türkçe Kadın Sesi (Microsoft Neural)
+KATYA_VOICE = "tr-TR-EmelNeural"
 
 ai_client = None
 if GEMINI_API_KEY:
@@ -81,23 +83,30 @@ async def execute_mother_order(order_text: str) -> str:
     groups_context = "Yönettiğim Gruplar:\n" + ("\n".join([f"- {info['title']}: ID {cid}" for cid, info in active_groups.items()]) if active_groups else "Henüz bir grupta değilim.")
     prompt = f"{groups_context}\n\nAnnemin Emri: {order_text}"
 
-    try:
-        response = ai_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=KATYA_SYSTEM_PROMPT,
-                tools=ALL_TOOLS,
-                temperature=0.7,
+    last_error = None
+    for model_name in FALLBACK_MODELS:
+        try:
+            response = ai_client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=KATYA_SYSTEM_PROMPT,
+                    tools=ALL_TOOLS,
+                    temperature=0.7,
+                )
             )
-        )
-        return response.text.strip()
-    except Exception as e:
-        log_event("ERR", f"AI Hatası: {e}")
-        return f"Bir aksaklık yaşadım anneciğim: {e}"
+            return response.text.strip()
+        except Exception as e:
+            last_error = e
+            log_event("WARN", f"Model {model_name} yanıt vermedi/yoğun, bir sonrakine geçiliyor: {e}")
+            await asyncio.sleep(0.2)
+            continue
+
+    log_event("ERR", f"Tüm modeller başarısız oldu: {last_error}")
+    return "Şu an sunucularda anlık bir yoğunluk var anneciğim, birkaç saniye sonra tekrar dener misin?"
 
 async def text_to_speech_base64(text: str) -> str:
-    """Türkçe kadın sesi üretip base64 formatında döner."""
+    """Doğal Türkçe kadın sesi üretip base64 formatında döner."""
     try:
         communicate = edge_tts.Communicate(text, KATYA_VOICE, rate="+10%", pitch="+5Hz")
         audio_data = bytearray()
@@ -411,7 +420,7 @@ LIVE_ORB_HTML = """
         const pts = 60;
         for (let i = 0; i <= pts; i++) {
           const theta = (i / pts) * Math.PI * 2;
-          const wave = Math.sin(theta * 4 + time * 3 + layer) * (12 * energy);
+          const wave = Math.sin(theta * 4 + time * 3 + layer) * (10 * energy);
           const cr = r + wave - (layer * 10);
           const x = cx + Math.cos(theta) * cr;
           const y = cy + Math.sin(theta) * cr;
