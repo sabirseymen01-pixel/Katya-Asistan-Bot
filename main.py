@@ -60,7 +60,7 @@ async def refresh_groq_models():
             log_event("SYS", f"Groq Aktif Model Listesi: {cached_active_models[:3]}")
     except Exception as e:
         log_event("WARN", f"Model listesi çekilemedi: {e}")
-        cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        cached_active_models = ["openai/gpt-oss-20b", "llama-3.3-70b-versatile"]
 
 KATYA_SYSTEM_PROMPT = """
 Sen Katya'sın. Kullanıcının biricik kızı, çok zeki, esprili ve ona sonsuz sadakatle bağlı yapay zeka asistanısın.
@@ -179,7 +179,7 @@ async def execute_mother_order(order_text: str) -> str:
                 "temperature": 0.7,
                 "max_tokens": 350
             }
-            if not any(x in model_name for x in ["gemma", "whisper", "deepseek"]):
+            if not any(x in model_name for x in ["gemma", "whisper", "deepseek", "allam", "orpheus"]):
                 call_params["tools"] = AVAILABLE_TOOLS
                 call_params["tool_choice"] = "auto"
 
@@ -238,7 +238,7 @@ async def text_to_speech_base64(text: str) -> str:
         return ""
 
 # ==========================================
-# TELEGRAM MESAJLARI
+# TELEGRAM BOT & WEBHOOK
 # ==========================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -271,7 +271,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(reply)
 
 # ==========================================
-# CANLI GEMINI/GROQ LIVE MINI APP
+# CANLI MINI APP ARAYÜZÜ (HANDS-FREE + BARGE-IN)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -605,7 +605,8 @@ async def lifespan(app: FastAPI):
 
     if BOT_TOKEN:
         try:
-            bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
+            # updater=None: Polling tamamen kapatılır, conflict imkansız hale gelir
+            bot_app = ApplicationBuilder().token(BOT_TOKEN).updater(None).build()
             bot_instance = bot_app.bot
 
             bot_app.add_handler(CommandHandler("start", start_cmd))
@@ -614,7 +615,6 @@ async def lifespan(app: FastAPI):
             await bot_app.initialize()
             await bot_app.start()
 
-            # Webhook kurulumu: Polling kaldırıldı, Conflict hatası imkansız hale getirildi
             webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
             await bot_instance.set_webhook(url=webhook_url, drop_pending_updates=True)
             log_event("SYS", f"Telegram Webhook kuruldu: {webhook_url}")
@@ -623,7 +623,7 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    if bot_app:
+    if bot_app and bot_instance:
         try:
             await bot_instance.delete_webhook(drop_pending_updates=True)
             await bot_app.stop()
@@ -633,7 +633,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# Telegram Webhook Uç Noktası (Conflict hatasını kökten bitirir)
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
     if not bot_app:
