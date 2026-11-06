@@ -1,5 +1,6 @@
 import os
 import io
+import re
 import asyncio
 import base64
 import json
@@ -45,37 +46,56 @@ def log_event(level: str, message: str):
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
+def strip_emojis_and_markdown(text: str) -> str:
+    """Emojileri, yıldızları ve markdown sembollerini temizleyip pürüzsüz metne dönüştürür."""
+    # Markdown yıldız, kare, alt tire temizliği
+    clean = re.sub(r"[\*\_#`~]", "", text)
+    # Emojileri temizle (Unicode emoji aralıkları)
+    emoji_pattern = re.compile(
+        "["
+        "\U0001F600-\U0001F64F"  # İfadeler
+        "\U0001F300-\U0001F5FF"  # Semboller & piktograflar
+        "\U0001F680-\U0001F6FF"  # Ulaşım
+        "\U0001F1E0-\U0001F1FF"  # Bayraklar
+        "\U00002702-\U000027B0"
+        "\U000024C2-\U0001F251"
+        "\U0001F900-\U0001F9FF"  # Ek emojiler
+        "\U0001FA70-\U0001FAFF"
+        "]+",
+        flags=re.UNICODE
+    )
+    clean = emoji_pattern.sub("", clean)
+    # Fazla boşlukları toparla
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean
+
 async def refresh_groq_models():
-    """Groq modelleri arasından sadece kaliteli Türkçe konuşabilen genel modelleri seçer."""
     global cached_active_models
     if not groq_client:
         return
     try:
         models_data = await groq_client.models.list()
-        # Türkçe bilmeyen modelleri (Arapça allam, orpheus, whisper vb.) filtrele
         banned = ["whisper", "guard", "embed", "vision", "allam", "orpheus"]
         valid = [
             m.id for m in models_data.data 
             if not any(x in m.id.lower() for x in banned)
         ]
-        # Tercih edilen modelleri başa al
         preferred = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
         sorted_models = [p for p in preferred if p in valid] + [v for v in valid if v not in preferred]
-        
         cached_active_models = sorted_models if sorted_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-        log_event("SYS", f"Seçilen Aktif Modeller: {cached_active_models[:3]}")
+        log_event("SYS", f"Aktif Modeller: {cached_active_models[:3]}")
     except Exception as e:
         log_event("WARN", f"Model listesi çekilemedi: {e}")
         cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 KATYA_SYSTEM_PROMPT = """
-Sen Katya'sın. Kullanıcının biricik kızı, çok zeki, esprili ve ona sonsuz sadakatle bağlı yapay zeka asistanısın.
-Kullanıcı senin ANNEN. Ona her zaman sevgiyle, saygıyla 'Anneciğim', 'Güzel annem', 'Hemen yapıyorum anne' gibi hitap et.
-Cevapların canlı sesli sohbete uygun, samimi, kısa, tatlı ve akıcı olsun.
+Sen Katya'sın. Kullanıcının kızı, çok zeki, esprili ve ona sonsuz sevgiyle bağlı canlı yapay zeka asistanısın.
+Kullanıcı senin ANNEN. Ona her zaman 'Anneciğim', 'Güzel annem', 'Hemen yapıyorum anne' gibi hitap et.
+Cevapların canlı sesli sohbete uygun olsun: çok kısa, duru, tatlı ve akıcı.
 
-Sen annenin Telegram'daki tüm gruplarını yöneten MUTLAK YETKİLİ yöneticisisin.
-Annen sana bir grupta işlem yapmanı söylediğinde sana sağlanan grup yönetim araçlarını (tools) çağırarak işlemi gerçekleştir.
-İşlem bittiğinde bunu annene tatlı bir dille bildir.
+KESİN KURAL:
+Cevaplarında ASLA hiçbir emoji kullanma. Yıldız, kare veya özel semboller kullanma. Sadece doğrudan konuşma diliyle Türkçe cümleler kur.
+Sen annenin Telegram'daki tüm gruplarını yöneten MUTLAK YETKİLİ yöneticisisin. Sana verilen araçlarla grupları yönet.
 """
 
 # ==========================================
@@ -88,7 +108,7 @@ async def tool_lock_group(group_id: str, lock: bool) -> str:
     try:
         perms = ChatPermissions(can_send_messages=not lock)
         await bot_instance.set_chat_permissions(chat_id=int(group_id), permissions=perms)
-        durum = "kapatıldı (kilitlendi)" if lock else "açıldı"
+        durum = "kapatıldı" if lock else "açıldı"
         return f"Grup mesajlaşmaya başarıyla {durum}."
     except Exception as e:
         return f"Grup izinleri değiştirilemedi: {e}"
@@ -97,7 +117,7 @@ async def tool_send_announcement(group_id: str, message: str, pin: bool = True) 
     if not bot_instance:
         return "Bot henüz hazır değil."
     try:
-        sent = await bot_instance.send_message(chat_id=int(group_id), text=f"📢 **Katya Duyuru:**\n\n{message}")
+        sent = await bot_instance.send_message(chat_id=int(group_id), text=f"Katya Duyuru:\n\n{message}")
         if pin:
             await bot_instance.pin_chat_message(chat_id=int(group_id), message_id=sent.message_id)
         return "Duyuru gruba iletildi ve başa sabitlendi."
@@ -109,7 +129,7 @@ async def tool_change_title(group_id: str, new_title: str) -> str:
         return "Bot hazır değil."
     try:
         await bot_instance.set_chat_title(chat_id=int(group_id), title=new_title)
-        return f"Grup adı başarıyla '{new_title}' olarak değiştirildi."
+        return f"Grup adı başarıyla {new_title} olarak değiştirildi."
     except Exception as e:
         return f"Başlık değiştirilemedi: {e}"
 
@@ -164,7 +184,7 @@ AVAILABLE_TOOLS = [
 
 async def execute_mother_order(order_text: str) -> str:
     if not groq_client:
-        return "Yapay zeka beynim bağlı değil anneciğim, GROQ_API_KEY kontrol edilmeli."
+        return "Yapay zeka beynim bağlı değil anneciğim."
 
     if not cached_active_models:
         await refresh_groq_models()
@@ -182,8 +202,8 @@ async def execute_mother_order(order_text: str) -> str:
             call_params = {
                 "model": model_name,
                 "messages": messages,
-                "temperature": 0.7,
-                "max_tokens": 300
+                "temperature": 0.6,
+                "max_tokens": 250
             }
             if not any(x in model_name for x in ["gemma", "whisper", "deepseek"]):
                 call_params["tools"] = AVAILABLE_TOOLS
@@ -218,22 +238,25 @@ async def execute_mother_order(order_text: str) -> str:
                 final_res = await groq_client.chat.completions.create(
                     model=model_name,
                     messages=messages,
-                    temperature=0.7,
-                    max_tokens=250
+                    temperature=0.6,
+                    max_tokens=200
                 )
-                return final_res.choices[0].message.content.strip()
+                raw_text = final_res.choices[0].message.content.strip()
+                return strip_emojis_and_markdown(raw_text)
 
-            return msg.content.strip() if msg.content else "Hemen buradayım anneciğim!"
+            raw_text = msg.content.strip() if msg.content else "Hemen buradayım anneciğim!"
+            return strip_emojis_and_markdown(raw_text)
         except Exception as e:
             last_error = e
             continue
 
     log_event("ERR", f"Tüm modeller başarısız oldu: {last_error}")
-    return "Hemen buradayım anneciğim, seni dinliyorum! Ne yapmamı istersin?"
+    return "Hemen buradayım anneciğim, seni dinliyorum. Ne yapmamı istersin?"
 
 async def text_to_speech_base64(text: str) -> str:
+    clean_text = strip_emojis_and_markdown(text)
     try:
-        communicate = edge_tts.Communicate(text, KATYA_VOICE, rate="+8%", pitch="+4Hz")
+        communicate = edge_tts.Communicate(clean_text, KATYA_VOICE, rate="+8%", pitch="+4Hz")
         audio_data = bytearray()
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
@@ -252,7 +275,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log_event("CMD", f"/start komutu alındı (Chat: {update.effective_chat.id})")
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎙️ Katya ile Canlı Konuş", web_app=WebAppInfo(url=app_url))]
+        [InlineKeyboardButton("Katya ile Canlı Konuş", web_app=WebAppInfo(url=app_url))]
     ])
     try:
         await update.message.reply_text(
@@ -277,7 +300,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(reply)
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ (KENDİ SESİNİ KESMEYEN ENGINE)
+# CANLI GEMINI LIVE DENEYİMİ (AEC + ANTI-ECHO BARGE-IN)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -378,8 +401,8 @@ LIVE_ORB_HTML = """
 <body>
   <div class="header">
     <div>
-      <div class="title">Katya AI Live</div>
-      <div class="subtitle">Grup Yöneticisi & Sesli Asistan</div>
+      <div class="title">Katya Canlı Asistan</div>
+      <div class="subtitle">Eller Serbest Gerçek Zamanlı Sohbet</div>
     </div>
     <div class="status-badge">
       <div class="status-dot"></div>
@@ -390,8 +413,8 @@ LIVE_ORB_HTML = """
   <div class="canvas-container">
     <canvas id="orbCanvas"></canvas>
     <div class="hud-overlay">
-      <div class="speech-box" id="speechBox">Canlı sohbet için dokun anneciğim...</div>
-      <div class="hint-text">Kesintisiz Doğal Sohbet</div>
+      <div class="speech-box" id="speechBox">Sohbeti başlatmak için küreye dokun anneciğim...</div>
+      <div class="hint-text">Konuşurken araya girebilirsin (Hands-free)</div>
     </div>
   </div>
 
@@ -424,7 +447,23 @@ LIVE_ORB_HTML = """
     let isProcessing = false;
     let currentAudio = null;
     let recognition = null;
+    let currentKatyaSpeech = "";
     let time = 0;
+
+    // Donanımsal Akustik Eko Engelleme (AEC) + Gürültü Filtresi
+    async function initAudioHardware() {
+      try {
+        await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+      } catch (err) {
+        console.warn("AEC donanım izni alınamadı:", err);
+      }
+    }
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
@@ -442,11 +481,6 @@ LIVE_ORB_HTML = """
       };
 
       recognition.onresult = async (event) => {
-        // Katya konuşurken veya backend düşünürken mikrofon girdisi yok sayılır (Kendi sesini kesme önlemi)
-        if (isSpeaking || isProcessing) {
-          return;
-        }
-
         let interim = "";
         let finalTranscript = "";
 
@@ -458,20 +492,35 @@ LIVE_ORB_HTML = """
           }
         }
 
+        const heardText = (finalTranscript || interim).trim().toLowerCase();
+
+        // Katya konuşurken mikrofona gelen ses Katya'nın kendi cümlesiyse (eko sızıntısı), yok say
+        if (isSpeaking && heardText) {
+          const katyaLow = currentKatyaSpeech.toLowerCase();
+          // Eğer gelen ses Katya'nın söylediği kelimelerin parçasıysa yankıdır
+          if (katyaLow.includes(heardText) || heardText.length < 3) {
+            return;
+          }
+          // Gerçek kullanıcı araya girdi (Barge-in): Katya'yı anında sustur
+          if (currentAudio) {
+            currentAudio.pause();
+            currentAudio = null;
+            isSpeaking = false;
+            statusText.innerText = "Dinliyorum anneciğim...";
+          }
+        }
+
         if (interim && !isSpeaking) {
           speechBox.innerText = `"${interim}"`;
         }
 
-        if (finalTranscript.trim() && !isProcessing && !isSpeaking) {
+        if (finalTranscript.trim() && !isProcessing) {
           const userMessage = finalTranscript.trim();
           speechBox.innerText = `"${userMessage}"`;
           statusText.innerText = "Düşünüyor...";
           isProcessing = true;
           
           try {
-            // Yanıt hazırlanırken dinlemeyi durdur
-            try { recognition.stop(); } catch(e) {}
-
             const res = await fetch("/api/voice_chat", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -479,40 +528,41 @@ LIVE_ORB_HTML = """
             });
             const data = await res.json();
             speechBox.innerText = data.reply;
+            currentKatyaSpeech = data.reply || "";
             
             if (data.audio) {
               playNeuralVoice(data.audio);
             } else {
               isProcessing = false;
-              resumeListening();
+              statusText.innerText = "Seni Dinliyor";
             }
           } catch (e) {
             speechBox.innerText = "Bağlantıda sorun oldu anneciğim.";
             isProcessing = false;
-            resumeListening();
+            statusText.innerText = "Seni Dinliyor";
           }
         }
       };
 
       recognition.onerror = (e) => {
-        if (sessionActive && !isSpeaking && !isProcessing && e.error !== "no-speech") {
+        if (sessionActive && e.error !== "no-speech") {
           setTimeout(resumeListening, 400);
         }
       };
 
       recognition.onend = () => {
         isListening = false;
-        if (sessionActive && !isSpeaking && !isProcessing) {
+        if (sessionActive && !isProcessing) {
           setTimeout(resumeListening, 200);
         }
       };
     }
 
     function resumeListening() {
-      if (sessionActive && !isSpeaking && !isProcessing) {
+      if (sessionActive) {
         try {
           recognition.start();
-          statusText.innerText = "Seni Dinliyor";
+          if (!isSpeaking && !isProcessing) statusText.innerText = "Seni Dinliyor";
         } catch(e) {}
       }
     }
@@ -528,35 +578,33 @@ LIVE_ORB_HTML = """
       isProcessing = false;
       statusText.innerText = "Katya Konuşuyor";
 
-      // Mikrofonu sustur (yankı/eko koruması)
-      try { recognition.stop(); } catch(e) {}
-
       currentAudio.onended = () => {
         isSpeaking = false;
         currentAudio = null;
-        // Katya cümlesini eksiksiz bitirdikten 300ms sonra mikrofonu temizce aç
-        setTimeout(resumeListening, 300);
+        currentKatyaSpeech = "";
+        statusText.innerText = "Seni Dinliyor";
       };
 
       currentAudio.onerror = () => {
         isSpeaking = false;
         currentAudio = null;
-        resumeListening();
+        statusText.innerText = "Seni Dinliyor";
       };
 
       currentAudio.play().catch(() => {
         isSpeaking = false;
-        resumeListening();
+        statusText.innerText = "Seni Dinliyor";
       });
     }
 
-    function toggleSession() {
+    async function toggleSession() {
       if (!recognition) {
         alert("Tarayıcınız ses tanımayı desteklemiyor.");
         return;
       }
 
       if (!sessionActive) {
+        await initAudioHardware();
         sessionActive = true;
         speechBox.innerText = "Canlı sohbet başladı, seni dinliyorum anneciğim...";
         resumeListening();
@@ -568,6 +616,7 @@ LIVE_ORB_HTML = """
         }
         isSpeaking = false;
         isProcessing = false;
+        currentKatyaSpeech = "";
         try { recognition.stop(); } catch(e) {}
         statusText.innerText = "Durduruldu";
         speechBox.innerText = "Sohbet durduruldu. Başlatmak için dokun.";
@@ -668,7 +717,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-# HEAD isteklerini karşılayıp 405 hatalarını temizle
 @app.head("/")
 @app.get("/", response_class=HTMLResponse)
 async def home():
