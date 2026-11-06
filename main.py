@@ -1,7 +1,7 @@
 import os
 import asyncio
 import io
-import wave
+import subprocess
 from datetime import datetime
 from collections import deque
 from contextlib import asynccontextmanager
@@ -124,19 +124,24 @@ async def init_voice_engine():
 
 # --- Canlı Konuşma İşleme ---
 
-async def transcribe_audio_bytes(audio_bytes: bytes) -> str:
-    """Ses verisini Groq Whisper-large-v3 ile Türkçe metne çevirir."""
-    if not groq_client or not audio_bytes:
+async def transcribe_audio_file(file_path: str) -> str:
+    """Kaydedilen ses klibini Groq Whisper ile Türkçe metne çevirir."""
+    if not groq_client or not os.path.exists(file_path):
         return ""
     try:
+        # Dosya boyutu kontrolü (boş/sessiz kayıtları elemek için)
+        if os.path.getsize(file_path) < 4000:
+            return ""
+
         loop = asyncio.get_event_loop()
         def _call_groq():
-            return groq_client.audio.transcriptions.create(
-                file=("speech.wav", audio_bytes),
-                model="whisper-large-v3",
-                language="tr",
-                response_format="text"
-            )
+            with open(file_path, "rb") as f:
+                return groq_client.audio.transcriptions.create(
+                    file=(os.path.basename(file_path), f.read()),
+                    model="whisper-large-v3",
+                    language="tr",
+                    response_format="text"
+                )
         res = await loop.run_in_executor(None, _call_groq)
         return str(res).strip()
     except Exception as e:
@@ -214,38 +219,49 @@ async def speak_in_voice(chat_id: int, text: str):
                 pass
         is_speaking = False
 
-# --- Canlı Mikrofon Yakalayıcı (Full-Duplex) ---
-
-async def handle_user_speech(chat_id: int, audio_bytes: bytes):
-    """Mikrofondan gelen sesi metne döker ve Katya'yı konuşturur."""
-    global is_speaking
-    if is_speaking or not audio_bytes:
-        return
-
-    text = await transcribe_audio_bytes(audio_bytes)
-    if not text or len(text.strip()) < 3:
-        return
-
-    # Arka plan gürültüsü veya anlamsız kısa sesleri filtrele
-    cleaned = text.strip().lower()
-    if cleaned in ["teşekkürler", "sağol", "alt yazı", "altyazı", "müzik"]:
-        return
-
-    log_event("STT", f"Duyuldu: '{text}'")
-    stats["live_listens"] += 1
-
-    # Gemini Live yanıtı üret ve odaya konuş
-    reply = await generate_ai_response(f"Kullanıcı mikrofondan sesli sohbette şunu söyledi: {text}")
-    await speak_in_voice(chat_id, reply)
+# --- Gerçek Zamanlı Canlı Dinleme Döngüsü (Live Loop) ---
 
 async def live_voice_listener(chat_id: int):
-    """Odadaki katılımcıların mikrofon akışını dinleyen döngü."""
-    log_event("SYS", "Canli dinleme sensoru baslatildi.")
+    """Odadaki mikrofon akışını dinler; konuşma bitince Groq ve Gemini ile cevaplar."""
+    global is_speaking
+    log_event("SYS", "Canli dinleme motoru baslatildi.")
+    
+    capture_file = f"capture_{abs(chat_id)}.wav"
+    
     while stats["in_voice_chat"]:
-        await asyncio.sleep(1.0)
-        # Katya konuşuyorsa kendi sesini dinlememesi için bekletilir
+        await asyncio.sleep(0.5)
         if is_speaking:
+            await asyncio.sleep(2.0)
             continue
+
+        try:
+            # 2.5 saniyelik ses parçasını yakalama denemesi
+            if hasattr(call_client, "record"):
+                try:
+                    await call_client.record(chat_id, capture_file, duration=3)
+                except Exception:
+                    pass
+
+            if os.path.exists(capture_file) and os.path.getsize(capture_file) > 5000:
+                text = await transcribe_audio_file(capture_file)
+                try:
+                    os.remove(capture_file)
+                except Exception:
+                    pass
+
+                if text and len(text.strip()) > 3:
+                    cleaned = text.strip().lower()
+                    # Anlamsız arka plan ve altyazı kalıplarını filtrele
+                    if cleaned in ["teşekkürler", "sağol", "altyazı", "müzik", "abone ol"]:
+                        continue
+
+                    log_event("STT", f"Duyuldu: '{text}'")
+                    stats["live_listens"] += 1
+
+                    reply = await generate_ai_response(f"Sesli sohbette mikrofondan şu söylendi: {text}")
+                    await speak_in_voice(chat_id, reply)
+        except Exception as e:
+            await asyncio.sleep(1.0)
 
 # --- Komutlar ---
 
@@ -255,7 +271,7 @@ async def join_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     active_chat_id = chat_id
 
     log_event("CMD", f"/seskatil - Chat ID: {chat_id}")
-    await update.message.reply_text("Sesli sohbete bağlanılıyor ve canlı dinleme açılıyor...")
+    await update.message.reply_text("Sesli sohbete bağlanılıyor ve karşılıklı konuşma modu açılıyor...")
 
     greeting = "Selam Golden grubu! Ben Katya, sesli sohbete bağlandım. Beni duyabiliyor musunuz?"
     err = await speak_in_voice(chat_id, greeting)
@@ -266,7 +282,7 @@ async def join_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if live_listen_task and not live_listen_task.done():
             live_listen_task.cancel()
         live_listen_task = asyncio.create_task(live_voice_listener(chat_id))
-        await update.message.reply_text("Katya odada! Konuşmacı yetkisini verip doğrudan mikrofondan konuşabilirsiniz.")
+        await update.message.reply_text("Katya odada! Beni konuşmacı yapıp (sessizliği kaldırarak) doğrudan mikrofondan konuşabilirsiniz.")
 
 async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
@@ -361,6 +377,12 @@ async def lifespan(app: FastAPI):
             await bot_app.updater.stop()
             await bot_app.stop()
             await bot_app.shutdown()
+        except Exception:
+            pass
+
+    if call_client:
+        try:
+            await call_client.stop()
         except Exception:
             pass
 
