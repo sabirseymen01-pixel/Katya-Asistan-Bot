@@ -11,3 +11,4 @@ tgcrypto==1.2.5
 google-genai
 groq==0.9.0
 numpy==1.26.4
+webrtcvad-wheels==2.0.14
