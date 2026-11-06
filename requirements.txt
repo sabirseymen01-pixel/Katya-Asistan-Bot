@@ -1,8 +1,8 @@
 fastapi
 uvicorn[standard]
 python-multipart
-python-telegram-bot
 groq
 httpx
 edge-tts
 pydantic
+motor
