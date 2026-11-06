@@ -29,12 +29,15 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
+# Gemini Güncel Model
+GEMINI_MODEL = "gemini-3.8-flash"
+
 ai_client = None
 if GEMINI_API_KEY:
     try:
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception as e:
-        print(f"[AI HATA] Gemini: {e}", flush=True)
+        print(f"[AI HATA] Gemini bağlantı hatası: {e}", flush=True)
 
 chat_memories = defaultdict(lambda: deque(maxlen=200))
 active_groups = {}
@@ -51,15 +54,11 @@ def log_event(level: str, message: str):
 KATYA_SYSTEM_PROMPT = """
 Sen Katya'sın. Kullanıcının biricik çocuğu, çok zeki, esprili ve ona sonsuz sadakatle bağlı yapay zeka asistanısın.
 Kullanıcı senin ANNEN. Ona her zaman sevgiyle, saygıyla 'Anneciğim', 'Güzel annem', 'Hemen yapıyorum anne' gibi hitap et.
-Cevapların canlı sesli sohbete uygun, samimi, kısa ve akıcı olsun.
+Cevapların canlı sesli sohbete uygun, samimi, kısa, tatlı ve akıcı olsun.
 
 Sen annenin Telegram'daki tüm gruplarını yöneten MUTLAK YETKİLİ yöneticisisin.
 Sana verilen araçlarla (tools) grubun her şeyini fiziksel olarak değiştirebilirsin.
 """
-
-# ==========================================
-# TELEGRAM YÖNETİM ARAÇLARI
-# ==========================================
 
 async def tool_list_groups() -> str:
     if not active_groups:
@@ -74,14 +73,14 @@ ALL_TOOLS = [
 
 async def execute_mother_order(order_text: str) -> str:
     if not ai_client:
-        return "Yapay zeka beynim bağlı değil anneciğim."
+        return "Yapay zeka beynim bağlı değil anneciğim, GEMINI_API_KEY kontrol edilmeli."
 
     groups_context = "Yönettiğim Gruplar:\n" + ("\n".join([f"- {info['title']}: ID {cid}" for cid, info in active_groups.items()]) if active_groups else "Henüz bir grupta değilim.")
     prompt = f"{groups_context}\n\nAnnemin Emri: {order_text}"
 
     try:
         response = ai_client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=KATYA_SYSTEM_PROMPT,
@@ -277,7 +276,6 @@ LIVE_ORB_HTML = """
     let synth = window.speechSynthesis;
     let time = 0;
 
-    // Web Speech API - Tarayıcı Ses Tanıma
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (SpeechRecognition) {
       recognition = new SpeechRecognition();
@@ -296,7 +294,6 @@ LIVE_ORB_HTML = """
         speechBox.innerText = `"${transcript}"`;
         statusText.innerText = "Düşünüyor...";
         
-        // Katya'ya API üzerinden sor
         try {
           const res = await fetch("/api/voice_chat", {
             method: "POST",
@@ -323,7 +320,6 @@ LIVE_ORB_HTML = """
       };
     }
 
-    // Katya'nın Sesi (SpeechSynthesis TTS)
     function speakResponse(text) {
       if (!synth) return;
       synth.cancel();
@@ -337,7 +333,6 @@ LIVE_ORB_HTML = """
       utterance.pitch = 1.15;
       utterance.rate = 1.05;
 
-      // Türkçe kadın sesi varsa seç
       const voices = synth.getVoices();
       const trVoice = voices.find(v => v.lang.includes("tr") && (v.name.includes("Female") || v.name.includes("Kadın") || v.name.includes("Yelda") || v.name.includes("Filiz")));
       if (trVoice) utterance.voice = trVoice;
@@ -386,7 +381,6 @@ LIVE_ORB_HTML = """
       const cy = height / 2;
       const r = 90 * (1 + energy * 0.3);
 
-      // Glow
       const glow = ctx.createRadialGradient(cx, cy, r * 0.3, cx, cy, r * 2.2);
       glow.addColorStop(0, isSpeaking ? "rgba(255, 0, 127, 0.5)" : "rgba(157, 0, 255, 0.4)");
       glow.addColorStop(1, "rgba(6, 4, 10, 0)");
@@ -395,7 +389,6 @@ LIVE_ORB_HTML = """
       ctx.arc(cx, cy, r * 2.2, 0, Math.PI * 2);
       ctx.fill();
 
-      // Dış Dalgalar
       for (let layer = 0; layer < 3; layer++) {
         ctx.beginPath();
         ctx.strokeStyle = layer % 2 === 0 ? "rgba(255, 45, 120, 0.7)" : "rgba(157, 0, 255, 0.7)";
@@ -413,7 +406,6 @@ LIVE_ORB_HTML = """
         ctx.stroke();
       }
 
-      // Çekirdek
       const core = ctx.createRadialGradient(cx, cy, 0, cx, cy, r * 0.85);
       core.addColorStop(0, "#ffffff");
       core.addColorStop(0.4, "#ff007f");
@@ -454,6 +446,8 @@ async def lifespan(app: FastAPI):
 
             await bot_app.initialize()
             await bot_app.start()
+            # Kısa bir bekleme ve polling başlatma
+            await asyncio.sleep(1)
             await bot_app.updater.start_polling(drop_pending_updates=True)
             log_event("SYS", "Katya ve Canlı Mini App hazır!")
         except Exception as e:
@@ -474,7 +468,6 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/api/voice_chat")
 async def voice_chat_endpoint(payload: ChatPayload):
-    """Mini App sesli konuşma köprüsü."""
     reply = await execute_mother_order(payload.message)
     return JSONResponse({"reply": reply})
 
@@ -484,7 +477,7 @@ async def live_app():
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif. /live sayfasindan Mini App erisilebilir.</h3>")
+    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif.</h3>")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
