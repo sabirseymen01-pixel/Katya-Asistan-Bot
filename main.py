@@ -31,11 +31,10 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
-# Yoğunluk yaşamamak için alternatif ve stabil modeller
+# Google'ın zorunlu kıldığı güncel modeller
 FALLBACK_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-pro",
-    "gemini-2.0-flash"
+    "gemini-3.8-flash",
+    "gemini-3.1-pro-preview"
 ]
 
 KATYA_VOICE = "tr-TR-EmelNeural"
@@ -102,12 +101,12 @@ async def execute_mother_order(order_text: str) -> str:
                 return response.text.strip()
         except Exception as e:
             last_error = e
-            log_event("WARN", f"Model {model_name} yoğunluk verdi: {e}")
-            await asyncio.sleep(0.15)
+            log_event("WARN", f"Model {model_name} denenirken hata: {e}")
+            await asyncio.sleep(0.3)
             continue
 
-    log_event("ERR", f"Tüm modeller denendi: {last_error}")
-    return "Hemen buradayım anneciğim, seni dinliyorum!"
+    log_event("ERR", f"Tüm modeller başarısız: {last_error}")
+    return "Şu an sunucu bağlantımda küçük bir aksaklık var anneciğim, hemen tekrar dener misin?"
 
 async def text_to_speech_base64(text: str) -> str:
     """Doğal Türkçe kadın sesi üretip base64 formatında döner."""
@@ -321,7 +320,6 @@ LIVE_ORB_HTML = """
       };
 
       recognition.onresult = async (event) => {
-        // Araya girme (Barge-in): Kullanıcı ses çıkardığı an Katya konuşuyorsa sustur
         if (isSpeaking && currentAudio) {
           currentAudio.pause();
           currentAudio = null;
@@ -368,13 +366,12 @@ LIVE_ORB_HTML = """
 
       recognition.onerror = (e) => {
         if (sessionActive && e.error !== "no-speech") {
-          setTimeout(() => { if (sessionActive) recognition.start(); }, 300);
+          setTimeout(() => { if (sessionActive) try { recognition.start(); } catch(err) {} }, 300);
         }
       };
 
       recognition.onend = () => {
         isListening = false;
-        // Hands-free: Oturum açıksa arka planda otomatik yeniden başlat
         if (sessionActive && !isSpeaking) {
           try { recognition.start(); } catch(err) {}
         }
@@ -393,7 +390,6 @@ LIVE_ORB_HTML = """
       currentAudio.onended = () => {
         isSpeaking = false;
         statusText.innerText = "Seni Dinliyor";
-        // Katya susunca mikrofonu hemen aktif dinlemeye al
         if (sessionActive && !isListening) {
           try { recognition.start(); } catch(err) {}
         }
