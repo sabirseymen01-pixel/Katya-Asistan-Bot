@@ -33,7 +33,7 @@ if GEMINI_API_KEY:
     try:
         ai_client = genai.Client(api_key=GEMINI_API_KEY)
     except Exception as e:
-        print(f"[AI HATA] Gemini: {e}", flush=True)
+        print(f"[AI HATA] Gemini bağlantı hatası: {e}", flush=True)
 
 # Çoklu grup hafızası ve bot örneği
 chat_memories = defaultdict(lambda: deque(maxlen=200))
@@ -196,9 +196,9 @@ ALL_TOOLS = [
 
 async def execute_mother_order(order_text: str) -> str:
     if not ai_client:
-        return "Yapay zeka beynim bağlı değil anneciğim."
+        return "Yapay zeka beynim bağlı değil anneciğim, lütfen GEMINI_API_KEY ayarını kontrol et."
 
-    groups_context = "Yönettiğim Gruplar:\n" + "\n".join([f"- {info['title']}: ID {cid}" for cid, info in active_groups.items()])
+    groups_context = "Yönettiğim Gruplar:\n" + ("\n".join([f"- {info['title']}: ID {cid}" for cid, info in active_groups.items()]) if active_groups else "Henüz bir grupta değilim.")
     prompt = f"{groups_context}\n\nAnnemin Emri: {order_text}"
 
     try:
@@ -246,7 +246,7 @@ async def execute_mother_order(order_text: str) -> str:
 
                 ack = ai_client.models.generate_content(
                     model="gemini-2.5-flash",
-                    contents=f"Eylem sonucu: {result}. Annene görevi tamamladığını sevgiyle ve tatlı bir dille bildir.",
+                    contents=f"Eylem sonucu: {result}. Annene görevi tamamladığını sevgiyle bildir.",
                     config=types.GenerateContentConfig(system_instruction=KATYA_SYSTEM_PROMPT)
                 )
                 return ack.text.strip()
@@ -262,16 +262,21 @@ async def execute_mother_order(order_text: str) -> str:
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Kullanıcıya Mini App canlı ses butonunu gönderir."""
-    chat_url = RENDER_EXTERNAL_URL if RENDER_EXTERNAL_URL else "https://google.com"
+    chat_url = RENDER_EXTERNAL_URL if RENDER_EXTERNAL_URL else "https://katya-asistan-bot.onrender.com"
     app_url = f"{chat_url}/live"
+
+    log_event("CMD", f"/start komutu alındı (Chat: {update.effective_chat.id})")
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("🎙️ Katya ile Canlı Konuş", web_app=WebAppInfo(url=app_url))]
     ])
-    await update.message.reply_text(
-        "Merhaba anneciğim! Gruplarını yönetmek veya benimle canlı konuşmak için aşağıdaki butona basabilirsin.",
-        reply_markup=keyboard
-    )
+    try:
+        await update.message.reply_text(
+            "Merhaba anneciğim! Gruplarını yönetmek veya benimle canlı konuşmak için aşağıdaki butona basabilirsin.",
+            reply_markup=keyboard
+        )
+    except Exception as e:
+        log_event("ERR", f"/start yanıt hatası: {e}")
 
 async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat or not update.message:
@@ -280,6 +285,8 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
     chat = update.effective_chat
     user = update.effective_user
     text = update.message.text or update.message.caption or "[Medya/Dosya]"
+
+    log_event("MSG", f"Gelen Mesaj ({chat.type}) [{user.first_name if user else 'Anonim'}]: {text}")
 
     if chat.type in ["group", "supergroup"]:
         if chat.id not in active_groups:
@@ -295,9 +302,13 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
         })
 
     if chat.type == "private":
-        log_event("ORDER", f"Annemden Emir: {text[:35]}")
-        reply = await execute_mother_order(text)
-        await update.message.reply_text(reply)
+        log_event("ORDER", f"Annemden Emir: {text[:40]}")
+        try:
+            reply = await execute_mother_order(text)
+            await update.message.reply_text(reply)
+        except Exception as e:
+            log_event("ERR", f"Özel mesaj yanıtlama hatası: {e}")
+            await update.message.reply_text("Bir aksaklık oldu anneciğim, loglarıma bakar mısın?")
 
 # ==========================================
 # CANLI PEMBE/MOR MINI APP HTML ARAYÜZÜ
@@ -440,10 +451,9 @@ LIVE_ORB_HTML = """
     window.addEventListener("resize", resize);
     resize();
 
-    let state = "LISTENING"; // LISTENING, SPEAKING, IDLE
+    let state = "LISTENING";
     let baseRadius = 100;
     let time = 0;
-    let micLevel = 0.35;
     let audioContext, analyser, microphone, dataArray;
     let isMicActive = false;
 
@@ -553,6 +563,14 @@ async def lifespan(app: FastAPI):
         try:
             bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
             bot_instance = bot_app.bot
+            
+            # Eski Webhook kalıntılarını silip güncellemeleri temizle
+            try:
+                await bot_instance.delete_webhook(drop_pending_updates=True)
+                log_event("SYS", "Eski Telegram Webhook kaydı temizlendi.")
+            except Exception as we:
+                log_event("WARN", f"Webhook temizlenirken uyarı: {we}")
+
             bot_app.add_handler(CommandHandler("start", start_cmd))
             bot_app.add_handler(MessageHandler(filters.ALL, telegram_message_handler))
 
@@ -567,7 +585,8 @@ async def lifespan(app: FastAPI):
 
     if bot_app:
         try:
-            await bot_app.updater.stop()
+            if bot_app.updater and bot_app.updater.running:
+                await bot_app.updater.stop()
             await bot_app.stop()
             await bot_app.shutdown()
         except Exception:
