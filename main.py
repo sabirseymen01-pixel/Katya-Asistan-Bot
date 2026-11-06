@@ -49,15 +49,19 @@ def log_event(level: str, message: str):
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
+# ==========================================
+# KALICI DİSK DEPOSU
+# ==========================================
+
 def load_groups_disk():
     global active_groups
     if os.path.exists(GROUPS_FILE):
         try:
             with open(GROUPS_FILE, "r", encoding="utf-8") as f:
                 active_groups = json.load(f)
-            log_event("SYS", f"Diskten {len(active_groups)} grup yüklendi: {list(active_groups.keys())}")
+            log_event("SYS", f"Diskten yüklendi: {list(active_groups.keys())}")
         except Exception as e:
-            log_event("WARN", f"Grup verisi okunamadı: {e}")
+            log_event("WARN", f"Grup dosyası okunamadı: {e}")
 
 def save_groups_disk():
     try:
@@ -318,35 +322,43 @@ async def text_to_speech_base64(text: str) -> str:
         return ""
 
 # ==========================================
-# TELEGRAM BOT & DİNAMİK GRUP TETİKLEYİCİLERİ
+# TELEGRAM BOT HANDLERS
 # ==========================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     app_url = f"{RENDER_EXTERNAL_URL}/live"
-    log_event("CMD", f"/start komutu alındı (Chat: {update.effective_chat.id})")
+    log_event("CMD", f"/start komutu geldi (Chat: {update.effective_chat.id})")
 
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Katya Canlı Asistan", web_app=WebAppInfo(url=app_url))]
     ])
     try:
         await update.message.reply_text(
-            "Merhaba anneciğim! Canlı konuşmak ve grupları yönetmek için butona basabilirsin.",
+            "Merhaba anneciğim! Canlı konuşmak ve grupları yönetmek için aşağıdaki butona dokunabilirsin.",
             reply_markup=keyboard
         )
     except Exception as e:
-        pass
+        log_event("ERR", f"/start yanıt verilemedi: {e}")
 
 async def bind_group_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Grupta /bagla veya /katya yazıldığında grubu anında hafızaya kilitler."""
     chat = update.effective_chat
-    if chat and chat.type in ["group", "supergroup"]:
+    if not chat:
+        return
+    log_event("CMD", f"/bagla komutu geldi (Chat: {chat.id}, Tip: {chat.type})")
+    
+    if chat.type in ["group", "supergroup"]:
         cid = str(chat.id)
         active_groups[cid] = {"title": chat.title}
         save_groups_disk()
-        log_event("SYS", f"Grup Manuel Olarak Bağlandı: {chat.title} ({cid})")
+        log_event("SYS", f"Grup Hafızaya Bağlandı: {chat.title} ({cid})")
         await update.message.reply_text(f"Bu grubu başarıyla hafızama kaydettim anneciğim: {chat.title}")
     else:
-        await update.message.reply_text("Bu komutu yönetmemi istediğin grupta yazmalısın anneciğim.")
+        # Eğer özel mesajda /bagla dendiyse son bilinenleri göster
+        if active_groups:
+            gruplar = ", ".join([v['title'] for v in active_groups.values()])
+            await update.message.reply_text(f"Şu an bağlı olduğum gruplar: {gruplar} anneciğim.")
+        else:
+            await update.message.reply_text("Beni grubuna ekleyip grupta /bagla yazman gerekiyor anneciğim.")
 
 async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -354,7 +366,7 @@ async def my_chat_member_handler(update: Update, context: ContextTypes.DEFAULT_T
         cid = str(chat.id)
         active_groups[cid] = {"title": chat.title}
         save_groups_disk()
-        log_event("SYS", f"Grup Otomatik Algılandı: {chat.title} ({cid})")
+        log_event("SYS", f"Grup Katılım Algılandı: {chat.title} ({cid})")
 
 async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.effective_chat:
@@ -365,18 +377,19 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
     user_name = user.first_name if user else "Biri"
     text = update.message.text if update.message and update.message.text else ""
 
-    # Grupta atılan her mesajda grubu belleğe al
+    # Grupta atılan her mesajda grubu kaydet
     if chat.type in ["group", "supergroup"]:
         cid = str(chat.id)
         if cid not in active_groups:
             active_groups[cid] = {"title": chat.title}
             save_groups_disk()
-            log_event("SYS", f"Grup Mesajından Kaydedildi: {chat.title} ({cid})")
+            log_event("SYS", f"Grup Otomatik Kaydedildi: {chat.title} ({cid})")
         if text:
             chat_context_log.append(f"[{chat.title}] {user_name}: {text[:60]}")
         return
 
-    if chat.type == "private" and text:
+    # Özel mesaj gelirse Katya cevap verir
+    if chat.type == "private" and text and not text.startswith("/"):
         chat_context_log.append(f"[Özel] {user_name}: {text[:60]}")
         log_event("MSG", f"Özel Mesaj: {text}")
         reply = await execute_mother_order(text)
@@ -739,7 +752,6 @@ async def lifespan(app: FastAPI):
             bot_instance = bot_app.bot
 
             bot_app.add_handler(CommandHandler("start", start_cmd))
-            # Manuel bağlama komutları
             bot_app.add_handler(CommandHandler("bagla", bind_group_cmd))
             bot_app.add_handler(CommandHandler("katya", bind_group_cmd))
             bot_app.add_handler(ChatMemberHandler(my_chat_member_handler, ChatMemberHandler.MY_CHAT_MEMBER))
@@ -749,55 +761,7 @@ async def lifespan(app: FastAPI):
             await bot_app.start()
 
             webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
-            # Filtresiz tam webhook: Telegram'daki tüm güncellemeleri koşulsuz al
-            await bot_instance.set_webhook(
-                url=webhook_url, 
-                drop_pending_updates=True
-            )
-            log_event("SYS", f"Telegram Webhook kuruldu: {webhook_url}")
+            await bot_instance.set_webhook(url=webhook_url, drop_pending_updates=True)
+            log_event("SYS", f"Telegram Webhook aktif: {webhook_url}")
         except Exception as e:
             log_event("ERR", f"Bot webhook başlatma hatası: {e}")
-
-    yield
-
-    if bot_app and bot_instance:
-        try:
-            await bot_instance.delete_webhook(drop_pending_updates=True)
-            await bot_app.stop()
-            await bot_app.shutdown()
-        except Exception:
-            pass
-
-app = FastAPI(lifespan=lifespan)
-
-@app.head("/")
-@app.get("/", response_class=HTMLResponse)
-async def home():
-    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif.</h3>")
-
-@app.head("/live")
-@app.get("/live", response_class=HTMLResponse)
-async def live_app():
-    return HTMLResponse(content=LIVE_ORB_HTML)
-
-@app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
-    if not bot_app:
-        return JSONResponse({"ok": False})
-    try:
-        data = await request.json()
-        update = Update.de_json(data, bot_app.bot)
-        await bot_app.process_update(update)
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        return JSONResponse({"ok": False})
-
-@app.post("/api/voice_chat")
-async def voice_chat_endpoint(payload: ChatPayload):
-    reply = await execute_mother_order(payload.message)
-    audio_base64 = await text_to_speech_base64(reply)
-    return JSONResponse({"reply": reply, "audio": audio_base64})
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
