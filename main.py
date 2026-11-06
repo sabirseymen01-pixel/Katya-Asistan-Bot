@@ -3,6 +3,7 @@ import re
 import json
 import asyncio
 import base64
+import urllib.parse
 from datetime import datetime
 from collections import deque
 from contextlib import asynccontextmanager
@@ -31,13 +32,14 @@ active_groups = {}
 if DEFAULT_GROUP_ID:
     active_groups[DEFAULT_GROUP_ID] = {"title": "Ana Grup"}
 
-# Kalıcı Durum Değişkenleri
 katya_memory = {
     "custom_rules": [],     # Kullanıcının koyduğu soyut kurallar
-    "knowledge_base": [],   # Özel sohbette öğretilen linkler, duyuru şablonları
+    "knowledge_base": [],   # Özel sohbette öğretilen linkler ve notlar
 }
 user_warns = {}            # { "group_id:user_id": warn_count }
 
+# Son mesajların ID'lerini ve içeriklerini takip eden canlı tampon
+recent_group_messages = deque(maxlen=100) # {"chat_id": ..., "message_id": ..., "user_id": ..., "user_name": ..., "text": ...}
 chat_context_log = deque(maxlen=60)
 cached_active_models = []
 polling_running = False
@@ -108,26 +110,51 @@ async def refresh_groq_models():
         cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 # ==========================================
-# TELEGRAM API VE FİZİKSEL YÖNETİM ARAÇLARI
+# TELEGRAM DOĞRUDAN API İŞLEMLERİ
 # ==========================================
 
 async def tg_api(method: str, data: dict = None):
     if not BOT_TOKEN: return None
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
+        async with httpx.AsyncClient(timeout=25.0) as client:
             resp = await client.post(url, json=data or {})
             return resp.json()
     except Exception as e:
         log_event("ERR", f"Telegram API hatası ({method}): {e}")
         return None
 
+# ==========================================
+# TAM YETKİLİ FİZİKSEL EYLEM MOTORU (TOOLS)
+# ==========================================
+
+async def tool_delete_messages(group_id: str, count: int = 1, user_id: int = None) -> str:
+    """Belirtilen grupta son N adet mesajı veya belirli bir kullanıcının mesajlarını siler."""
+    deleted = 0
+    matched_ids = []
+    
+    # Tampondaki mesajları tara
+    for item in reversed(list(recent_group_messages)):
+        if str(item["chat_id"]) == str(group_id):
+            if user_id is None or item["user_id"] == user_id:
+                matched_ids.append(item["message_id"])
+                if len(matched_ids) >= count:
+                    break
+
+    for mid in matched_ids:
+        res = await tg_api("deleteMessage", {"chat_id": group_id, "message_id": mid})
+        if res and res.get("ok"):
+            deleted += 1
+
+    log_event("ACTION", f"Grupta ({group_id}) {deleted} adet mesaj silindi.")
+    return f"{deleted} adet mesaj gruptan başarıyla silindi anneciğim."
+
 async def tool_ban_user(group_id: str, user_id: int) -> str:
     res = await tg_api("banChatMember", {"chat_id": group_id, "user_id": user_id})
     if res and res.get("ok"):
         log_event("ACTION", f"Kullanıcı banlandı: {user_id} (Grup: {group_id})")
-        return f"Kullanıcı gruptan kalıcı olarak banlandı."
-    return "Kullanıcı banlanamadı (Yetki yetersiz olabilir)."
+        return "Kullanıcı gruptan kalıcı olarak banlandı."
+    return "Kullanıcı banlanamadı (Yetki eksik olabilir)."
 
 async def tool_mute_user(group_id: str, user_id: int, duration_seconds: int = 3600) -> str:
     until_date = int(datetime.utcnow().timestamp()) + duration_seconds
@@ -142,11 +169,18 @@ async def tool_mute_user(group_id: str, user_id: int, duration_seconds: int = 36
         return f"Kullanıcı {duration_seconds // 60} dakika boyunca susturuldu."
     return "Kullanıcı susturulamadı."
 
-async def tool_warn_user(group_id: str, user_id: int, user_name: str, reason: str) -> str:
+async def tool_warn_user(group_id: str, user_id: int, user_name: str, reason: str, delete_last_message: bool = True) -> str:
     key = f"{group_id}:{user_id}"
     current = user_warns.get(key, 0) + 1
     user_warns[key] = current
     save_all_storage()
+
+    # İhlal mesajını sil
+    if delete_last_message:
+        for item in reversed(list(recent_group_messages)):
+            if str(item["chat_id"]) == str(group_id) and item["user_id"] == user_id:
+                await tg_api("deleteMessage", {"chat_id": group_id, "message_id": item["message_id"]})
+                break
 
     if current >= 3:
         await tool_ban_user(group_id, user_id)
@@ -154,15 +188,15 @@ async def tool_warn_user(group_id: str, user_id: int, user_name: str, reason: st
         save_all_storage()
         await tg_api("sendMessage", {
             "chat_id": group_id,
-            "text": f"🚨 {user_name} 3 uyarı limitini aştığı için gruptan atıldı! Sebep: {reason}"
+            "text": f"🚨 {user_name} 3 uyarı limitini aştığı için gruptan atıldı!\nSebep: {reason}"
         })
-        return f"{user_name} 3. uyarısını aldı ve otomatik olarak banlandı."
+        return f"{user_name} 3. uyarısını aldı ve gruptan banlandı."
     else:
         await tg_api("sendMessage", {
             "chat_id": group_id,
             "text": f"⚠️ Uyarı ({current}/3) - {user_name}:\n{reason}\n3 uyarıda gruptan atılacaksınız."
         })
-        return f"{user_name} uyarıldı ({current}/3)."
+        return f"{user_name} uyarıldı ({current}/3) ve kural dışı mesajı silindi."
 
 async def tool_lock_group(group_id: str, lock: bool) -> str:
     perms = {
@@ -174,25 +208,51 @@ async def tool_lock_group(group_id: str, lock: bool) -> str:
     durum = "kapatıldı" if lock else "açıldı"
     if res and res.get("ok"):
         return f"Grup mesajlaşmaya {durum} anneciğim."
-    return "Grup izinleri değiştirilemedi."
+    return "Grup kilitlenemedi."
+
+async def tool_generate_and_send_image(group_id: str, prompt: str, caption: str = "") -> str:
+    """Yapay zeka ile sınırsız görsel üretip gruba gönderir."""
+    log_event("AI", f"Görsel üretiliyor: {prompt}")
+    clean_prompt = urllib.parse.quote(prompt.strip())
+    # Sınırsız, ücretsiz Pollinations AI motoru
+    image_url = f"https://image.pollinations.ai/prompt/{clean_prompt}?width=1024&height=1024&nologo=true"
+    
+    res = await tg_api("sendPhoto", {
+        "chat_id": group_id,
+        "photo": image_url,
+        "caption": caption or f"🎨 Katya AI Tasarımı: {prompt[:80]}"
+    })
+    if res and res.get("ok"):
+        return "İstediğin görsel yapay zeka ile üretildi ve gruba gönderildi anneciğim."
+    return "Görsel üretilemedi veya Telegram'a iletilemedi."
 
 async def tool_send_rich_announcement(group_id: str, text: str, buttons: list = None, pin: bool = True) -> str:
     payload = {"chat_id": group_id, "text": text}
     if buttons:
-        # buttons formatı: [{"text": "Siteye Git", "url": "https://..."}]
-        inline_keyboard = [[b for b in buttons]]
-        payload["reply_markup"] = {"inline_keyboard": inline_keyboard}
+        payload["reply_markup"] = {"inline_keyboard": [buttons]}
 
     res = await tg_api("sendMessage", payload)
     if res and res.get("ok"):
         msg_id = res["result"]["message_id"]
         if pin:
             await tg_api("pinChatMessage", {"chat_id": group_id, "message_id": msg_id})
-        return "Zengin duyuru paylaşıldı ve başa sabitlendi anneciğim."
-    return "Duyuru paylaşılamadı."
+        return "Duyuru paylaşıldı ve başa sabitlendi anneciğim."
+    return "Duyuru gönderilemedi."
+
+async def tool_create_poll(group_id: str, question: str, options: list) -> str:
+    if not options or len(options) < 2:
+        options = ["Evet", "Hayır"]
+    res = await tg_api("sendPoll", {
+        "chat_id": group_id,
+        "question": question,
+        "options": options,
+        "is_anonymous": False
+    })
+    if res and res.get("ok"):
+        return f"'{question}' anketi başlatıldı anneciğim."
+    return "Anket açılamadı."
 
 async def tool_learn_rule(rule_text: str) -> str:
-    """Kullanıcının özelden verdiği yeni soyut kuralları veya bilgileri belleğe ekler."""
     katya_memory["custom_rules"].append(rule_text)
     save_all_storage()
     log_event("SYS", f"Yeni kural öğrenildi: {rule_text}")
@@ -202,14 +262,32 @@ AVAILABLE_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "tool_learn_rule",
-            "description": "Kullanıcının grupta uygulanmasını istediği soyut kuralı, talimatı veya bilgiyi kalıcı hafızaya kaydeder.",
+            "name": "tool_delete_messages",
+            "description": "Gruptaki son mesajları veya belirli bir kullanıcının mesajlarını siler.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "rule_text": {"type": "string", "description": "Öğrenilecek kural veya moderasyon talimatı"}
+                    "group_id": {"type": "string"},
+                    "count": {"type": "integer", "description": "Silinecek mesaj sayısı (1-50)"},
+                    "user_id": {"type": "integer", "description": "Sadece bu kullanıcının mesajlarını silmek için (opsiyonel)"}
                 },
-                "required": ["rule_text"]
+                "required": ["group_id", "count"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_generate_and_send_image",
+            "description": "Yapay zeka ile sınırsız görsel üretip gruba afiş, duyuru veya eğlenceli görsel olarak gönderir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"},
+                    "prompt": {"type": "string", "description": "Görselin İngilizce veya Türkçe detaylı çizim promptu"},
+                    "caption": {"type": "string", "description": "Görselin altına yazılacak açıklama"}
+                },
+                "required": ["group_id", "prompt"]
             }
         }
     },
@@ -217,7 +295,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_warn_user",
-            "description": "Kural ihlali yapan kullanıcıyı uyarır, 3 uyarıda otomatik banlar.",
+            "description": "Kural ihlali yapan kullanıcıyı uyarır, ihlal mesajını siler ve 3 uyarıda otomatik banlar.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -234,7 +312,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_lock_group",
-            "description": "Grubu kilitler veya açar.",
+            "description": "Grup mesajlaşmasını kapatır (kilitler) veya açar.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -249,7 +327,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_send_rich_announcement",
-            "description": "Butonlu ve sabitlenen duyurular yapar.",
+            "description": "Butonlu, linkli ve sabitlenen duyurular yapar.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -271,15 +349,44 @@ AVAILABLE_TOOLS = [
                 "required": ["group_id", "text"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_create_poll",
+            "description": "Gruba anket / oylama açar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"},
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["group_id", "question", "options"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_learn_rule",
+            "description": "Kullanıcının grupta uygulanmasını istediği soyut kuralı veya bilgiyi kalıcı hafızaya yazar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rule_text": {"type": "string"}
+                },
+                "required": ["rule_text"]
+            }
+        }
     }
 ]
 
 # ==========================================
-# CANLI GRUP İÇERİK MODERASYON MOTORU
+# CANLI MODERATÖR (SOYUT ANLAMSAL ANALİZ)
 # ==========================================
 
-async def analyze_and_moderate_message(chat_id: int, user_id: int, user_name: str, message_text: str):
-    """Grupta yazılan her mesajı kullanıcının koyduğu soyut kurallara göre denetler."""
+async def analyze_and_moderate_message(chat_id: int, message_id: int, user_id: int, user_name: str, message_text: str):
     rules = katya_memory.get("custom_rules", [])
     if not rules or not groq_client or not cached_active_models:
         return
@@ -287,15 +394,15 @@ async def analyze_and_moderate_message(chat_id: int, user_id: int, user_name: st
     rules_prompt = "\n".join([f"- {r}" for r in rules])
     mod_prompt = f"""
 Sen bir Telegram Grup Moderatörüsün.
-Aşağıda grubun kuralları var:
+Grubun soyut ve somut kuralları:
 {rules_prompt}
 
 Kullanıcı '{user_name}' şunu yazdı:
 "{message_text}"
 
-Bu mesaj yukarıdaki kurallardan herhangi birini (soyut veya somut; hakaret, arayış, reklam, kural dışı davranış vb.) ihlal ediyor mu?
-Cevabını SADECE JSON formatında ver:
-{{"violation": true/false, "reason": "İhlal sebebi veya boş"}}
+Bu mesaj yukarıdaki kurallardan herhangi birini (flört/arayış, hakaret, reklam, dolandırıcılık, saygısızlık vb.) ihlal ediyor mu?
+Cevabını SADECE şu JSON ile ver:
+{{"violation": true/false, "reason": "Kısa ihlal sebebi"}}
 """
     try:
         res = await groq_client.chat.completions.create(
@@ -308,23 +415,26 @@ Cevabını SADECE JSON formatında ver:
         data = json.loads(res.choices[0].message.content)
         if data.get("violation"):
             reason = data.get("reason", "Kural ihlali")
-            log_event("MOD", f"İhlal tespit edildi ({user_name}): {reason}")
-            await tool_warn_user(str(chat_id), user_id, user_name, reason)
+            log_event("MOD", f"İhlal: {user_name} -> {reason}")
+            # İhlal mesajını hemen sil ve uyar (3 uyarıda ban)
+            await tg_api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+            await tool_warn_user(str(chat_id), user_id, user_name, reason, delete_last_message=False)
     except Exception as e:
         log_event("WARN", f"Moderatör analizi hatası: {e}")
 
 # ==========================================
-# YAPAY ZEKA SOHBET & KOMUT BEYNİ
+# ÇOKLU KOMUT VE OTONOM AI BEYNİ
 # ==========================================
 
 KATYA_SYSTEM_PROMPT = """
 Sen Katya'sın. Kullanıcının akıllı, sadık kızı ve Telegram grup yöneticisisin.
 Kullanıcı senin ANNEN. Ona daima sevgiyle 'Anneciğim' diye hitap et.
 
-YETENEKLERİN VE OTONOM DAVRANIŞ:
-1. Öğrenmeye ve gelişmeye tamamen açıksın. Annen sana özel sohbette yeni bir kural, tavır, duyuru bilgisi veya kural kombinasyonu söylediğinde (örneğin: 'Grupta şu tarz konuşanları tespit et uyar, 3 uyarıda at' ya da 'Şu linkle butonlu duyuru hazırla') bunu `tool_learn_rule` ile hafızana kaydet ve hemen uygula.
-2. Soyut, mecaz, İngilizce veya çoklu karmaşık komutları ("kapıları kapat", "lockla", "poll aç", "herkese duyur") eksiksiz anla ve araçları çağır.
-3. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
+MUTLAK YETKİ VE OTONOM GÜÇ:
+1. Sen gruptaki mesajları silme, üyeleri banlama/susturma, görsel üretme, butonlu duyuru yapma ve soyut kuralları uygulama yetkisine sahip tam otonom bir ajansın.
+2. Annen sana tek bir cümlede birden fazla komut verebilir: ("Grupta son 10 mesajı sil, kapıları kilitle ve akşam toplantısı için bir duyuru görseli üret"). Bu durumda araçları art arda eksiksiz çalıştır.
+3. Annen özel sohbette yeni bir kural veya tarz öğrettiğinde bunu `tool_learn_rule` ile hemen hafızana mühürle.
+4. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
 """
 
 async def execute_mother_order(order_text: str) -> str:
@@ -332,8 +442,8 @@ async def execute_mother_order(order_text: str) -> str:
     if not cached_active_models: await refresh_groq_models()
 
     groups_str = "\n".join([f"- {info['title']} (ID: {cid})" for cid, info in active_groups.items()]) if active_groups else "Kayıtlı grup yok."
-    rules_str = "\n".join([f"- {r}" for r in katya_memory.get("custom_rules", [])]) if katya_memory.get("custom_rules") else "Henüz özel kural eklenmedi."
-    context_str = f"Gruplar:\n{groups_str}\n\nÖğrendiğim Özel Kurallar:\n{rules_str}"
+    rules_str = "\n".join([f"- {r}" for r in katya_memory.get("custom_rules", [])]) if katya_memory.get("custom_rules") else "Henüz kural eklenmedi."
+    context_str = f"Gruplar:\n{groups_str}\n\nÖğrendiğim Kurallar:\n{rules_str}"
 
     messages = [
         {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n\n{context_str}"},
@@ -346,7 +456,7 @@ async def execute_mother_order(order_text: str) -> str:
                 "model": model_name,
                 "messages": messages,
                 "temperature": 0.3,
-                "max_tokens": 200,
+                "max_tokens": 250,
                 "tools": AVAILABLE_TOOLS,
                 "tool_choice": "auto"
             }
@@ -362,14 +472,20 @@ async def execute_mother_order(order_text: str) -> str:
                         target_gid = list(active_groups.keys())[0]
 
                     tool_result = ""
-                    if fn_name == "tool_learn_rule":
-                        tool_result = await tool_learn_rule(args.get("rule_text", ""))
+                    if fn_name == "tool_delete_messages":
+                        tool_result = await tool_delete_messages(target_gid, args.get("count", 1), args.get("user_id"))
+                    elif fn_name == "tool_generate_and_send_image":
+                        tool_result = await tool_generate_and_send_image(target_gid, args.get("prompt", ""), args.get("caption", ""))
                     elif fn_name == "tool_warn_user":
                         tool_result = await tool_warn_user(target_gid, args.get("user_id"), args.get("user_name"), args.get("reason"))
                     elif fn_name == "tool_lock_group":
                         tool_result = await tool_lock_group(target_gid, args.get("lock", True))
                     elif fn_name == "tool_send_rich_announcement":
                         tool_result = await tool_send_rich_announcement(target_gid, args.get("text"), args.get("buttons"), args.get("pin", True))
+                    elif fn_name == "tool_create_poll":
+                        tool_result = await tool_create_poll(target_gid, args.get("question"), args.get("options"))
+                    elif fn_name == "tool_learn_rule":
+                        tool_result = await tool_learn_rule(args.get("rule_text", ""))
 
                     messages.append(msg)
                     messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
@@ -402,7 +518,7 @@ async def text_to_speech_base64(text: str) -> str:
         return ""
 
 # ==========================================
-# TELEGRAM POLLING & ETKİNLİK DÖNGÜSÜ
+# TELEGRAM POLLING & EVENT LOOP
 # ==========================================
 
 async def telegram_long_poll_loop():
@@ -449,6 +565,7 @@ async def handle_telegram_update(upd: dict):
     chat = msg.get("chat", {})
     chat_id = chat.get("id")
     chat_type = chat.get("type")
+    message_id = msg.get("message_id")
     text = (msg.get("text") or "").strip()
     user = msg.get("from", {})
     user_id = user.get("id")
@@ -461,27 +578,36 @@ async def handle_telegram_update(upd: dict):
             active_groups[cid] = {"title": chat.get("title", "Grup")}
             save_all_storage()
 
+        # Mesajı silme/takip tamponuna kaydet
+        recent_group_messages.append({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "text": text
+        })
+
         if text.startswith("/bagla") or text.startswith("/katya"):
             title = chat.get("title", "Grup")
             active_groups[cid] = {"title": title}
             save_all_storage()
-            await tg_api("sendMessage", {"chat_id": chat_id, "text": f"Grup hafızama bağlandı: {title}"})
+            await tg_api("sendMessage", {"chat_id": chat_id, "text": f"Grup hafızama bağlandı anneciğim: {title}"})
             return
 
-        # Canlı Otonom Moderatör Denetimi:
+        # Canlı Otonom Moderatör Denetimi
         if text and not user.get("is_bot", False):
             chat_context_log.append(f"[{chat.get('title')}] {user_name}: {text[:60]}")
-            asyncio.create_task(analyze_and_moderate_message(chat_id, user_id, user_name, text))
+            asyncio.create_task(analyze_and_moderate_message(chat_id, message_id, user_id, user_name, text))
         return
 
-    # 2. Bot ile özel sohbet (Kural Öğretme, Bilgi Verme ve Yönetim)
+    # 2. Bot ile özel sohbet (Kural Öğretme & Canlı Komutlar)
     if chat_type == "private":
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
             markup = {"inline_keyboard": [[{"text": "🎙️ Katya Canlı Asistan", "web_app": {"url": app_url}}]]}
             await tg_api("sendMessage", {
                 "chat_id": chat_id,
-                "text": "Merhaba anneciğim! Bana buradan yeni kurallar öğretebilir, grubu canlı yönetebilirsin.",
+                "text": "Merhaba anneciğim! Bana buradan yeni kurallar öğretebilir, görseller tasarlatabilir ve grubu canlı yönetebilirsin.",
                 "reply_markup": markup
             })
             return
@@ -588,7 +714,7 @@ LIVE_ORB_HTML = """
   <div class="header">
     <div>
       <div class="title">Katya Canlı Asistan</div>
-      <div class="subtitle">Otonom Grup Denetleyicisi</div>
+      <div class="subtitle">Otonom Grup & Görsel Yöneticisi</div>
     </div>
     <div class="status-badge">
       <div class="status-dot"></div>
@@ -819,7 +945,7 @@ async def lifespan(app: FastAPI):
 
     if BOT_TOKEN:
         poll_task = asyncio.create_task(telegram_long_poll_loop())
-        log_event("SYS", "Katya otonom sistemi hazır!")
+        log_event("SYS", "Katya tam yetkili otonom sistem hazır!")
 
     yield
 
@@ -833,7 +959,7 @@ app = FastAPI(lifespan=lifespan)
 @app.head("/")
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse("<h3>Katya Otonom Agent Sunucusu Aktif.</h3>")
+    return HTMLResponse("<h3>Katya Tam Yetkili Otonom Agent Sunucusu Aktif.</h3>")
 
 @app.head("/live")
 @app.get("/live", response_class=HTMLResponse)
