@@ -13,6 +13,7 @@ from pydantic import BaseModel
 import uvicorn
 import httpx
 import edge_tts
+import certifi
 from groq import AsyncGroq
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -25,11 +26,14 @@ DEFAULT_GROUP_ID = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 KATYA_VOICE = "tr-TR-EmelNeural"
 
-# MongoDB Bağlantısı
+# MongoDB Bağlantısı (TLS Sertifika Havuzu ile Güvenli Bağlantı)
 mongo_client = None
 db = None
 if MONGO_URI:
-    mongo_client = AsyncIOMotorClient(MONGO_URI)
+    mongo_client = AsyncIOMotorClient(
+        MONGO_URI,
+        tlsCAFile=certifi.where()
+    )
     db = mongo_client["katya_db"]
 
 scheduled_tasks = {}
@@ -45,11 +49,11 @@ def log_event(level: str, message: str):
 # ==========================================
 
 async def init_db_indexes():
-    """MongoDB TTL İndeksi: Mesajları tam 48 saat (Telegram silme sınırı) saklar, sonra otomatik temizler."""
+    """MongoDB TTL İndeksi: Mesajları 48 saat (Telegram silme sınırı) saklar, sonra otomatik temizler."""
     if db is None:
         return
     try:
-        # 48 saat = 172800 saniye sonra kendiliğinden silinen mesaj koleksiyonu
+        # 48 saat = 172800 saniye
         await db.messages.create_index("created_at", expireAfterSeconds=172800)
         await db.messages.create_index([("group_id", 1), ("message_id", 1)])
         await db.groups.create_index("group_id", unique=True)
@@ -129,6 +133,19 @@ async def db_reset_warn(group_id: str, user_id: int):
     if db is None: return
     await db.warns.delete_one({"group_id": str(group_id), "user_id": user_id})
 
+async def db_save_group_config(group_id: str, key: str, value: str):
+    if db is None: return
+    await db.configs.update_one(
+        {"group_id": str(group_id)},
+        {"$set": {key: value, "updated_at": datetime.now(timezone.utc)}},
+        upsert=True
+    )
+
+async def db_get_group_config(group_id: str):
+    if db is None: return {}
+    doc = await db.configs.find_one({"group_id": str(group_id)})
+    return doc or {}
+
 # ==========================================
 # YARDIMCI VE LLM HAZIRLIK
 # ==========================================
@@ -174,7 +191,7 @@ async def tg_api(method: str, data: dict = None):
 # ==========================================
 
 async def tool_delete_messages(group_id: str, count: int = 1, user_id: int = None, text_contains: str = None) -> str:
-    """MongoDB'deki 48 saatlik sınırsız depodan eşleşen mesajları çeker ve Telegram'dan siler."""
+    """MongoDB'deki 48 saatlik depodan mesajları filtreleyip Telegram'dan siler."""
     docs = await db_get_recent_messages(group_id, limit=count, user_id=user_id, text_contains=text_contains)
     deleted = 0
     for d in docs:
@@ -184,7 +201,7 @@ async def tool_delete_messages(group_id: str, count: int = 1, user_id: int = Non
             if db is not None:
                 await db.messages.delete_one({"_id": d["_id"]})
 
-    log_event("ACTION", f"Grup ({group_id}) {deleted} mesaj MongoDB kaydindan silindi.")
+    log_event("ACTION", f"Grup ({group_id}) {deleted} mesaj silindi.")
     return f"{deleted} adet mesaj basariyla silindi annecigim."
 
 async def tool_ban_user(group_id: str, user_id: int) -> str:
@@ -236,6 +253,14 @@ async def tool_warn_user(group_id: str, user_id: int, user_name: str, reason: st
         })
         return f"{user_name} uyarildi ({current}/3)."
 
+async def tool_unwarn_user(group_id: str, user_id: int, user_name: str) -> str:
+    await db_reset_warn(group_id, user_id)
+    await tg_api("sendMessage", {
+        "chat_id": group_id,
+        "text": f"✅ {user_name} kullanicisinin tum uyarilari sifirlandi."
+    })
+    return f"{user_name} uyarilari sifirlandi."
+
 async def tool_lock_group(group_id: str, lock: bool) -> str:
     perms = {"can_send_messages": not lock, "can_send_other_messages": not lock, "can_add_web_page_previews": not lock}
     res = await tg_api("setChatPermissions", {"chat_id": group_id, "permissions": perms})
@@ -256,6 +281,72 @@ async def tool_generate_and_send_image(group_id: str, prompt: str, caption: str 
         return "Gorsel uretildi ve gruba gonderildi annecigim."
     return "Gorsel iletilemedi."
 
+async def tool_send_rich_announcement(group_id: str, text: str, buttons: list = None, pin: bool = True) -> str:
+    payload = {"chat_id": group_id, "text": text}
+    if buttons:
+        payload["reply_markup"] = {"inline_keyboard": [buttons]}
+
+    res = await tg_api("sendMessage", payload)
+    if res and res.get("ok"):
+        mid = res["result"]["message_id"]
+        if pin:
+            await tg_api("pinChatMessage", {"chat_id": group_id, "message_id": mid})
+        return "Duyuru paylasildi ve basa sabitlendi annecigim."
+    return "Duyuru gonderilemedi."
+
+async def tool_pin_message(group_id: str, text: str = None) -> str:
+    if text:
+        res = await tg_api("sendMessage", {"chat_id": group_id, "text": text})
+        if res and res.get("ok"):
+            mid = res["result"]["message_id"]
+            await tg_api("pinChatMessage", {"chat_id": group_id, "message_id": mid})
+            return "Mesaj basa sabitlendi annecigim."
+    return "Sabitlenecek mesaj belirtilmedi."
+
+async def tool_unpin_message(group_id: str, unpin_all: bool = False) -> str:
+    method = "unpinAllChatMessages" if unpin_all else "unpinChatMessage"
+    res = await tg_api(method, {"chat_id": group_id})
+    if res and res.get("ok"):
+        return "Sabitlenen mesaj basariyla kaldirildi."
+    return "Sabit kaldirilamadi."
+
+# ==========================================
+# ZAMANLANMIŞ PERİYODİK DUYURU MOTORU
+# ==========================================
+
+async def periodic_announcement_worker(task_id: str, group_id: str, interval_min: int, message: str, btn_text: str = None, btn_url: str = None):
+    payload = {"chat_id": group_id, "text": message}
+    if btn_text and btn_url:
+        payload["reply_markup"] = {"inline_keyboard": [[{"text": btn_text, "url": btn_url}]]}
+
+    try:
+        while True:
+            await asyncio.sleep(interval_min * 60)
+            await tg_api("sendMessage", payload)
+            log_event("SCHED", f"Zamanli duyuru iletildi: {task_id}")
+    except asyncio.CancelledError:
+        log_event("SCHED", f"Zamanlayici durduruldu: {task_id}")
+
+def tool_schedule_announcement(group_id: str, interval_min: int, message: str, btn_text: str = None, btn_url: str = None) -> str:
+    task_id = f"{group_id}_{interval_min}_{message[:15]}"
+    if task_id in scheduled_tasks:
+        scheduled_tasks[task_id].cancel()
+
+    task = asyncio.create_task(
+        periodic_announcement_worker(task_id, group_id, interval_min, message, btn_text, btn_url)
+    )
+    scheduled_tasks[task_id] = task
+    return f"Her {interval_min} dakikada bir paylasilacak duyuru baslatildi annecigim."
+
+def tool_stop_scheduled_announcement(group_id: str) -> str:
+    stopped = 0
+    for tid, t in list(scheduled_tasks.items()):
+        if tid.startswith(str(group_id)):
+            t.cancel()
+            del scheduled_tasks[tid]
+            stopped += 1
+    return f"{stopped} adet zamanlanmis duyuru gorevi durduruldu."
+
 async def tool_learn_rule(group_id: str, rule_text: str) -> str:
     await db_save_rule(group_id, rule_text)
     return f"Yeni kural MongoDB hafizasina bu grup icin muhurlendi annecigim: '{rule_text}'."
@@ -274,7 +365,7 @@ AVAILABLE_TOOLS = [
                 "type": "object",
                 "properties": {
                     "group_id": {"type": "string"},
-                    "count": {"type": "integer", "description": "Silinecek adet"},
+                    "count": {"type": "integer", "description": "Silinecek adet (1-50)"},
                     "text_contains": {"type": "string", "description": "Mesaj icinde aranan kelime"}
                 },
                 "required": ["group_id", "count"]
@@ -300,6 +391,95 @@ AVAILABLE_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "tool_send_rich_announcement",
+            "description": "Butonlu, linkli ve sabitlenen zengin duyurular yapar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"},
+                    "text": {"type": "string"},
+                    "buttons": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": {"type": "string"},
+                                "url": {"type": "string"}
+                            },
+                            "required": ["text", "url"]
+                        }
+                    },
+                    "pin": {"type": "boolean"}
+                },
+                "required": ["group_id", "text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_schedule_announcement",
+            "description": "Grupta periyodik tekrarlanan duyuru baslatir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"},
+                    "interval_min": {"type": "integer"},
+                    "message": {"type": "string"},
+                    "btn_text": {"type": "string"},
+                    "btn_url": {"type": "string"}
+                },
+                "required": ["group_id", "interval_min", "message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_stop_scheduled_announcement",
+            "description": "Zamanlanmis periyodik duyurulari durdurur.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"}
+                },
+                "required": ["group_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_pin_message",
+            "description": "Yeni bir mesaji basa sabitler.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"},
+                    "text": {"type": "string"}
+                },
+                "required": ["group_id", "text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_unpin_message",
+            "description": "Sabitlenen mesaji veya tum sabitleri kaldirir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"},
+                    "unpin_all": {"type": "boolean"}
+                },
+                "required": ["group_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "tool_lock_group",
             "description": "Grubu mesajlasmaya kapatir veya acar.",
             "parameters": {
@@ -315,8 +495,25 @@ AVAILABLE_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "tool_warn_user",
+            "description": "Kullaniciyi uyarir, 3 uyariya ulasirsa kalici banlar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"},
+                    "user_id": {"type": "integer"},
+                    "user_name": {"type": "string"},
+                    "reason": {"type": "string"}
+                },
+                "required": ["group_id", "user_id", "user_name", "reason"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "tool_learn_rule",
-            "description": "Bu grup icin kalici soyut veya somut moderasyon kurali kaydeder.",
+            "description": "Bu grup icin kalici moderasyon kurali kaydeder.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -336,7 +533,8 @@ Kullanıcı senin ANNEN. Ona daima sevgiyle 'Anneciğim' diye hitap et.
 MUTLAK YETKİ VE ÇOKLU GRUP HAFIZASI:
 1. Yönettiğin gruplar birbirinden tamamen bağımsızdır. Kurallar ve uyarılar ilgili grubun ID'sine özel işlenir.
 2. 48 saat içindeki tüm mesajlar MongoDB'de saklanır; annen mesaj silme istediğinde (`tool_delete_messages`) adet veya kelime filtresiyle doğrudan silebilirsin.
-3. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
+3. Annen görsel üretme, butonlu duyuru, sabitleme veya periyodik zamanlama istediğinde tüm araçları zincirleme eksiksiz çalıştır.
+4. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
 """
 
 async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
@@ -382,8 +580,20 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                         tool_result = await tool_delete_messages(gid, args.get("count", 1), text_contains=args.get("text_contains"))
                     elif fn_name == "tool_generate_and_send_image":
                         tool_result = await tool_generate_and_send_image(gid, args.get("prompt", ""), args.get("caption", ""))
+                    elif fn_name == "tool_send_rich_announcement":
+                        tool_result = await tool_send_rich_announcement(gid, args.get("text"), args.get("buttons"), args.get("pin", True))
+                    elif fn_name == "tool_schedule_announcement":
+                        tool_result = tool_schedule_announcement(gid, args.get("interval_min", 10), args.get("message", ""), args.get("btn_text"), args.get("btn_url"))
+                    elif fn_name == "tool_stop_scheduled_announcement":
+                        tool_result = tool_stop_scheduled_announcement(gid)
+                    elif fn_name == "tool_pin_message":
+                        tool_result = await tool_pin_message(gid, text=args.get("text"))
+                    elif fn_name == "tool_unpin_message":
+                        tool_result = await tool_unpin_message(gid, args.get("unpin_all", False))
                     elif fn_name == "tool_lock_group":
                         tool_result = await tool_lock_group(gid, args.get("lock", True))
+                    elif fn_name == "tool_warn_user":
+                        tool_result = await tool_warn_user(gid, args.get("user_id"), args.get("user_name"), args.get("reason"))
                     elif fn_name == "tool_learn_rule":
                         tool_result = await tool_learn_rule(gid, args.get("rule_text", ""))
 
@@ -455,6 +665,97 @@ SADECE JSON: {{"violation": true/false, "reason": "kısa sebep"}}
         log_event("WARN", f"Moderasyon hatasi: {e}")
 
 # ==========================================
+# GOLDEN GUARDIAN KOMUT PARSER
+# ==========================================
+
+async def handle_golden_guardian_commands(chat_id: int, text: str, reply_to_msg: dict) -> bool:
+    cid = str(chat_id)
+    cmd = text.split()[0].lower() if text else ""
+
+    if cmd == "/welcome":
+        val = text[len("/welcome"):].strip()
+        await db_save_group_config(cid, "welcome_msg", val)
+        await tg_api("sendMessage", {"chat_id": chat_id, "text": "Hos geldin mesaji guncellendi annecigim."})
+        return True
+
+    if cmd == "/butonmetni":
+        val = text[len("/butonmetni"):].strip()
+        await db_save_group_config(cid, "btn_text", val)
+        await tg_api("sendMessage", {"chat_id": chat_id, "text": "Buton metni ayarlandi."})
+        return True
+
+    if cmd == "/butonlinki":
+        val = text[len("/butonlinki"):].strip()
+        await db_save_group_config(cid, "btn_url", val)
+        await tg_api("sendMessage", {"chat_id": chat_id, "text": "Buton linki ayarlandi."})
+        return True
+
+    if cmd == "/duyuru":
+        content = text[len("/duyuru"):].strip()
+        parts = [p.strip() for p in content.split("|")]
+        payload = {"chat_id": chat_id, "text": f"📢 Katya Duyuru:\n\n{parts[0]}"}
+        if len(parts) >= 3:
+            payload["reply_markup"] = {"inline_keyboard": [[{"text": parts[1], "url": parts[2]}]]}
+        res = await tg_api("sendMessage", payload)
+        if res and res.get("ok"):
+            mid = res["result"]["message_id"]
+            await tg_api("pinChatMessage", {"chat_id": chat_id, "message_id": mid})
+        return True
+
+    if cmd == "/zamanla":
+        content = text[len("/zamanla"):].strip()
+        parts = [p.strip() for p in content.split("|")]
+        if parts and parts[0].isdigit():
+            m_min = int(parts[0])
+            msg_txt = parts[1] if len(parts) > 1 else "Duyuru"
+            b_txt = parts[2] if len(parts) > 2 else None
+            b_url = parts[3] if len(parts) > 3 else None
+            res_str = tool_schedule_announcement(cid, m_min, msg_txt, b_txt, b_url)
+            await tg_api("sendMessage", {"chat_id": chat_id, "text": res_str})
+        return True
+
+    if cmd in ["/zamanladur", "/zamanla_dur"]:
+        res_str = tool_stop_scheduled_announcement(cid)
+        await tg_api("sendMessage", {"chat_id": chat_id, "text": res_str})
+        return True
+
+    if cmd == "/defol" and reply_to_msg:
+        target_uid = reply_to_msg.get("from", {}).get("id")
+        await tool_ban_user(cid, target_uid)
+        await tg_api("sendMessage", {"chat_id": chat_id, "text": "Kullanici gruptan defedildi."})
+        return True
+
+    if cmd == "/undefol" and reply_to_msg:
+        target_uid = reply_to_msg.get("from", {}).get("id")
+        await tool_unban_user(cid, target_uid)
+        await tg_api("sendMessage", {"chat_id": chat_id, "text": "Kullanicinin bani kaldirildi."})
+        return True
+
+    if cmd == "/itaat" and reply_to_msg:
+        target_uid = reply_to_msg.get("from", {}).get("id")
+        await tool_mute_user(cid, target_uid, 3600)
+        await tg_api("sendMessage", {"chat_id": chat_id, "text": "Kullanici 1 saat susturuldu."})
+        return True
+
+    if cmd == "/unitaat" and reply_to_msg:
+        target_uid = reply_to_msg.get("from", {}).get("id")
+        await tool_unmute_user(cid, target_uid)
+        await tg_api("sendMessage", {"chat_id": chat_id, "text": "Susturma kaldirildi."})
+        return True
+
+    if cmd == "/warn" and reply_to_msg:
+        target_user = reply_to_msg.get("from", {})
+        await tool_warn_user(cid, target_user.get("id"), target_user.get("first_name", "Uye"), "Yonetici uyarisi")
+        return True
+
+    if cmd == "/unwarn" and reply_to_msg:
+        target_user = reply_to_msg.get("from", {})
+        await tool_unwarn_user(cid, target_user.get("id"), target_user.get("first_name", "Uye"))
+        return True
+
+    return False
+
+# ==========================================
 # TELEGRAM POLLING & EVENT LOOP
 # ==========================================
 
@@ -507,6 +808,19 @@ async def handle_telegram_update(upd: dict):
     user_id = user.get("id")
     user_name = user.get("first_name", "Biri")
     reply_to = msg.get("reply_to_message")
+    new_members = msg.get("new_chat_members")
+
+    # Yeni üye katıldığında otomatik karşılama
+    if new_members and chat_type in ["group", "supergroup"]:
+        cfg = await db_get_group_config(str(chat_id))
+        w_msg = cfg.get("welcome_msg", "Grubumuza hos geldiniz!")
+        b_txt = cfg.get("btn_text")
+        b_url = cfg.get("btn_url")
+        payload = {"chat_id": chat_id, "text": f"Merhaba {new_members[0].get('first_name')}! {w_msg}"}
+        if b_txt and b_url:
+            payload["reply_markup"] = {"inline_keyboard": [[{"text": b_txt, "url": b_url}]]}
+        await tg_api("sendMessage", payload)
+        return
 
     # 1. Gruptan gelen mesajlar
     if chat_type in ["group", "supergroup"]:
@@ -522,12 +836,8 @@ async def handle_telegram_update(upd: dict):
             await tg_api("sendMessage", {"chat_id": chat_id, "text": f"Grup MongoDB hafizasina baglandi: {title}"})
             return
 
-        # Basit komutlar
-        if text == "/defol" and reply_to:
-            await tool_ban_user(cid, reply_to.get("from", {}).get("id"))
-            return
-        if text == "/itaat" and reply_to:
-            await tool_mute_user(cid, reply_to.get("from", {}).get("id"), 3600)
+        handled = await handle_golden_guardian_commands(chat_id, text, reply_to)
+        if handled:
             return
 
         # Canlı Kural Analizi
@@ -535,7 +845,7 @@ async def handle_telegram_update(upd: dict):
             asyncio.create_task(analyze_and_moderate_message(chat_id, message_id, user_id, user_name, text))
         return
 
-    # 2. Özel mesajlar
+    # 2. Özel mesajlar (Bot Chat)
     if chat_type == "private":
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
@@ -551,7 +861,7 @@ async def handle_telegram_update(upd: dict):
         await tg_api("sendMessage", {"chat_id": chat_id, "text": reply})
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ
+# CANLI MINI APP ARAYÜZÜ (SIFIR EKO)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -884,6 +1194,8 @@ async def lifespan(app: FastAPI):
     polling_running = False
     if poll_task:
         poll_task.cancel()
+    for t in scheduled_tasks.values():
+        t.cancel()
     if mongo_client:
         mongo_client.close()
 
