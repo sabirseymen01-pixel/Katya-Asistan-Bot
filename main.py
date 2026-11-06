@@ -8,7 +8,7 @@ from datetime import datetime
 from collections import deque, defaultdict
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -47,27 +47,23 @@ def log_event(level: str, message: str):
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 def strip_emojis_and_markdown(text: str) -> str:
-    """Emojileri, yıldızları ve markdown sembollerini temizleyip pürüzsüz metne dönüştürür."""
-    # Markdown yıldız, kare, alt tire temizliği
+    """Metindeki tüm emojileri, yıldızları ve markdown işaretlerini temizler."""
     clean = re.sub(r"[\*\_#`~]", "", text)
-    # Emojileri temizle (Unicode emoji aralıkları)
     emoji_pattern = re.compile(
         "["
-        "\U0001F600-\U0001F64F"  # İfadeler
-        "\U0001F300-\U0001F5FF"  # Semboller & piktograflar
-        "\U0001F680-\U0001F6FF"  # Ulaşım
-        "\U0001F1E0-\U0001F1FF"  # Bayraklar
+        "\U0001F600-\U0001F64F"
+        "\U0001F300-\U0001F5FF"
+        "\U0001F680-\U0001F6FF"
+        "\U0001F1E0-\U0001F1FF"
         "\U00002702-\U000027B0"
         "\U000024C2-\U0001F251"
-        "\U0001F900-\U0001F9FF"  # Ek emojiler
+        "\U0001F900-\U0001F9FF"
         "\U0001FA70-\U0001FAFF"
         "]+",
         flags=re.UNICODE
     )
     clean = emoji_pattern.sub("", clean)
-    # Fazla boşlukları toparla
-    clean = re.sub(r"\s+", " ", clean).strip()
-    return clean
+    return re.sub(r"\s+", " ", clean).strip()
 
 async def refresh_groq_models():
     global cached_active_models
@@ -83,67 +79,88 @@ async def refresh_groq_models():
         preferred = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
         sorted_models = [p for p in preferred if p in valid] + [v for v in valid if v not in preferred]
         cached_active_models = sorted_models if sorted_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-        log_event("SYS", f"Aktif Modeller: {cached_active_models[:3]}")
+        log_event("SYS", f"Aktif LLM Modelleri: {cached_active_models[:2]}")
     except Exception as e:
         log_event("WARN", f"Model listesi çekilemedi: {e}")
         cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 KATYA_SYSTEM_PROMPT = """
-Sen Katya'sın. Kullanıcının kızı, çok zeki, esprili ve ona sonsuz sevgiyle bağlı canlı yapay zeka asistanısın.
-Kullanıcı senin ANNEN. Ona her zaman 'Anneciğim', 'Güzel annem', 'Hemen yapıyorum anne' gibi hitap et.
-Cevapların canlı sesli sohbete uygun olsun: çok kısa, duru, tatlı ve akıcı.
+Sen Katya'sın. Kullanıcının biricik kızı, çok zeki, esprili ve ona sonsuz sadakatle bağlı yapay zeka asistanısın.
+Kullanıcı senin ANNEN. Ona her zaman sevgiyle 'Anneciğim', 'Güzel annem', 'Hemen hallediyorum anne' gibi hitap et.
+Cevapların canlı sesli sohbete uygun, samimi, kısa, duru ve akıcı olsun.
 
 KESİN KURAL:
-Cevaplarında ASLA hiçbir emoji kullanma. Yıldız, kare veya özel semboller kullanma. Sadece doğrudan konuşma diliyle Türkçe cümleler kur.
-Sen annenin Telegram'daki tüm gruplarını yöneten MUTLAK YETKİLİ yöneticisisin. Sana verilen araçlarla grupları yönet.
+Cevaplarında ASLA hiçbir emoji, sembol veya markdown yıldızları kullanma. Sadece doğrudan konuşma diliyle Türkçe cümleler kur.
+
+Sen annenin Telegram'daki tüm gruplarını yöneten MUTLAK YETKİLİ yöneticisisin.
+Annen sana bir grupta işlem yapmanı (kapatma, açma, banlama, susturma, anket açma, link üretme, yavaş mod vb.) söylediğinde sana verilen araçları (tools) kullanarak fiziksel olarak uygula.
 """
 
 # ==========================================
-# TELEGRAM GRUP YÖNETİM ARAÇLARI (TOOLS)
+# EKSİKSİZ TELEGRAM GRUP YÖNETİM MOTORU (TOOLS)
 # ==========================================
 
 async def tool_lock_group(group_id: str, lock: bool) -> str:
-    if not bot_instance:
-        return "Bot henüz hazır değil."
+    """Grubu mesajlaşmaya tamamen kapatır veya açar."""
+    if not bot_instance: return "Bot hazır değil."
     try:
         perms = ChatPermissions(can_send_messages=not lock)
         await bot_instance.set_chat_permissions(chat_id=int(group_id), permissions=perms)
-        durum = "kapatıldı" if lock else "açıldı"
-        return f"Grup mesajlaşmaya başarıyla {durum}."
-    except Exception as e:
-        return f"Grup izinleri değiştirilemedi: {e}"
+        return "Grup mesajlaşmaya kapatıldı." if lock else "Grup mesajlaşmaya açıldı."
+    except Exception as e: return f"İzin değiştirilemedi: {e}"
 
 async def tool_send_announcement(group_id: str, message: str, pin: bool = True) -> str:
-    if not bot_instance:
-        return "Bot henüz hazır değil."
+    """Gruba duyuru geçer ve mesaja sabitler."""
+    if not bot_instance: return "Bot hazır değil."
     try:
         sent = await bot_instance.send_message(chat_id=int(group_id), text=f"Katya Duyuru:\n\n{message}")
-        if pin:
-            await bot_instance.pin_chat_message(chat_id=int(group_id), message_id=sent.message_id)
-        return "Duyuru gruba iletildi ve başa sabitlendi."
-    except Exception as e:
-        return f"Duyuru gönderilemedi: {e}"
+        if pin: await bot_instance.pin_chat_message(chat_id=int(group_id), message_id=sent.message_id)
+        return "Duyuru paylaşıldı ve başa sabitlendi."
+    except Exception as e: return f"Duyuru gönderilemedi: {e}"
+
+async def tool_set_slow_mode(group_id: str, seconds: int) -> str:
+    """Grupta yavaş modu (slow mode) ayarlar."""
+    if not bot_instance: return "Bot hazır değil."
+    try:
+        await bot_instance.set_chat_slow_mode_delay(chat_id=int(group_id), slow_mode_delay=seconds)
+        return f"Yavaş mod {seconds} saniye olarak ayarlandı."
+    except Exception as e: return f"Yavaş mod ayarlanamadı: {e}"
+
+async def tool_create_poll(group_id: str, question: str, options: list) -> str:
+    """Grupta oylama / anket başlatır."""
+    if not bot_instance: return "Bot hazır değil."
+    try:
+        await bot_instance.send_poll(chat_id=int(group_id), question=question, options=options, is_anonymous=False)
+        return f"'{question}' anketi grupta başlatıldı."
+    except Exception as e: return f"Anket açılamadı: {e}"
+
+async def tool_create_invite_link(group_id: str) -> str:
+    """Gruba yeni davet linki üretir."""
+    if not bot_instance: return "Bot hazır değil."
+    try:
+        link = await bot_instance.create_chat_invite_link(chat_id=int(group_id), member_limit=1)
+        return f"Yeni davet linki oluşturuldu: {link.invite_link}"
+    except Exception as e: return f"Link üretilemedi: {e}"
 
 async def tool_change_title(group_id: str, new_title: str) -> str:
-    if not bot_instance:
-        return "Bot hazır değil."
+    """Grup başlığını değiştirir."""
+    if not bot_instance: return "Bot hazır değil."
     try:
         await bot_instance.set_chat_title(chat_id=int(group_id), title=new_title)
-        return f"Grup adı başarıyla {new_title} olarak değiştirildi."
-    except Exception as e:
-        return f"Başlık değiştirilemedi: {e}"
+        return f"Grup adı {new_title} yapıldı."
+    except Exception as e: return f"Grup adı değiştirilemedi: {e}"
 
 AVAILABLE_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "tool_lock_group",
-            "description": "Bir Telegram grubunda mesajlaşmayı tamamen kapatır veya açar.",
+            "description": "Grup mesajlaşmasını tamamen kapatır veya açar.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "group_id": {"type": "string", "description": "İşlem yapılacak grubun chat_id değeri"},
-                    "lock": {"type": "boolean", "description": "True ise kapatır, False ise açar"}
+                    "group_id": {"type": "string"},
+                    "lock": {"type": "boolean"}
                 },
                 "required": ["group_id", "lock"]
             }
@@ -153,13 +170,13 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_send_announcement",
-            "description": "Gruba önemli bir duyuru geçer ve mesaja iğneler/sabitler.",
+            "description": "Gruba önemli bir duyuru iletir ve başa sabitler.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "group_id": {"type": "string", "description": "Grubun chat_id değeri"},
-                    "message": {"type": "string", "description": "Gönderilecek mesaj"},
-                    "pin": {"type": "boolean", "description": "Mesaj sabitlensin mi?"}
+                    "group_id": {"type": "string"},
+                    "message": {"type": "string"},
+                    "pin": {"type": "boolean"}
                 },
                 "required": ["group_id", "message"]
             }
@@ -168,13 +185,58 @@ AVAILABLE_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "tool_change_title",
-            "description": "Grubun başlığını/ismini değiştirir.",
+            "name": "tool_set_slow_mode",
+            "description": "Grup üyelerinin mesaj atma bekleme süresini (yavaş mod) belirler.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "group_id": {"type": "string", "description": "Grubun chat_id değeri"},
-                    "new_title": {"type": "string", "description": "Yeni grup ismi"}
+                    "group_id": {"type": "string"},
+                    "seconds": {"type": "integer", "description": "Saniye (0, 10, 30, 60 vb.)"}
+                },
+                "required": ["group_id", "seconds"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_create_poll",
+            "description": "Gruba anket / oylama gönderir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"},
+                    "question": {"type": "string"},
+                    "options": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": ["group_id", "question", "options"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_create_invite_link",
+            "description": "Gruba özel yeni bir katılım davet linki oluşturur.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"}
+                },
+                "required": ["group_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_change_title",
+            "description": "Grubun ismini değiştirir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string"},
+                    "new_title": {"type": "string"}
                 },
                 "required": ["group_id", "new_title"]
             }
@@ -202,7 +264,7 @@ async def execute_mother_order(order_text: str) -> str:
             call_params = {
                 "model": model_name,
                 "messages": messages,
-                "temperature": 0.6,
+                "temperature": 0.5,
                 "max_tokens": 250
             }
             if not any(x in model_name for x in ["gemma", "whisper", "deepseek"]):
@@ -225,6 +287,12 @@ async def execute_mother_order(order_text: str) -> str:
                         tool_result = await tool_lock_group(args.get("group_id", ""), args.get("lock", True))
                     elif fn_name == "tool_send_announcement":
                         tool_result = await tool_send_announcement(args.get("group_id", ""), args.get("message", ""), args.get("pin", True))
+                    elif fn_name == "tool_set_slow_mode":
+                        tool_result = await tool_set_slow_mode(args.get("group_id", ""), args.get("seconds", 10))
+                    elif fn_name == "tool_create_poll":
+                        tool_result = await tool_create_poll(args.get("group_id", ""), args.get("question", ""), args.get("options", ["Evet", "Hayır"]))
+                    elif fn_name == "tool_create_invite_link":
+                        tool_result = await tool_create_invite_link(args.get("group_id", ""))
                     elif fn_name == "tool_change_title":
                         tool_result = await tool_change_title(args.get("group_id", ""), args.get("new_title", ""))
 
@@ -238,7 +306,7 @@ async def execute_mother_order(order_text: str) -> str:
                 final_res = await groq_client.chat.completions.create(
                     model=model_name,
                     messages=messages,
-                    temperature=0.6,
+                    temperature=0.5,
                     max_tokens=200
                 )
                 raw_text = final_res.choices[0].message.content.strip()
@@ -250,7 +318,7 @@ async def execute_mother_order(order_text: str) -> str:
             last_error = e
             continue
 
-    log_event("ERR", f"Tüm modeller başarısız oldu: {last_error}")
+    log_event("ERR", f"LLM hatası: {last_error}")
     return "Hemen buradayım anneciğim, seni dinliyorum. Ne yapmamı istersin?"
 
 async def text_to_speech_base64(text: str) -> str:
@@ -300,7 +368,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(reply)
 
 # ==========================================
-# CANLI GEMINI LIVE DENEYİMİ (AEC + ANTI-ECHO BARGE-IN)
+# CANLI MINI APP ARAYÜZÜ (DONANIMSAL MİKROFON İZOLASYONU)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -402,7 +470,7 @@ LIVE_ORB_HTML = """
   <div class="header">
     <div>
       <div class="title">Katya Canlı Asistan</div>
-      <div class="subtitle">Eller Serbest Gerçek Zamanlı Sohbet</div>
+      <div class="subtitle">Yankısız Doğrudan Sesli İletişim</div>
     </div>
     <div class="status-badge">
       <div class="status-dot"></div>
@@ -414,7 +482,7 @@ LIVE_ORB_HTML = """
     <canvas id="orbCanvas"></canvas>
     <div class="hud-overlay">
       <div class="speech-box" id="speechBox">Sohbeti başlatmak için küreye dokun anneciğim...</div>
-      <div class="hint-text">Konuşurken araya girebilirsin (Hands-free)</div>
+      <div class="hint-text">Tam Otomatik Ses Yalıtımlı İletişim</div>
     </div>
   </div>
 
@@ -447,21 +515,30 @@ LIVE_ORB_HTML = """
     let isProcessing = false;
     let currentAudio = null;
     let recognition = null;
-    let currentKatyaSpeech = "";
+    let audioStream = null;
     let time = 0;
 
-    // Donanımsal Akustik Eko Engelleme (AEC) + Gürültü Filtresi
-    async function initAudioHardware() {
-      try {
-        await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
-          }
+    // Donanımsal Akustik Eko Engelleme
+    async function initHardwareStream() {
+      if (!audioStream) {
+        try {
+          audioStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true
+            }
+          });
+        } catch(e) {}
+      }
+    }
+
+    // Katya konuşurken mikrofonu donanımsal olarak kapat (Katya asla kendini duyamaz)
+    function setHardwareMicEnabled(enabled) {
+      if (audioStream) {
+        audioStream.getAudioTracks().forEach(track => {
+          track.enabled = enabled;
         });
-      } catch (err) {
-        console.warn("AEC donanım izni alınamadı:", err);
       }
     }
 
@@ -481,6 +558,11 @@ LIVE_ORB_HTML = """
       };
 
       recognition.onresult = async (event) => {
+        // Katya konuşurken veya backend işlem yaparken gelen tüm sesler KESİNLİKLE yok sayılır
+        if (isSpeaking || isProcessing) {
+          return;
+        }
+
         let interim = "";
         let finalTranscript = "";
 
@@ -492,34 +574,20 @@ LIVE_ORB_HTML = """
           }
         }
 
-        const heardText = (finalTranscript || interim).trim().toLowerCase();
-
-        // Katya konuşurken mikrofona gelen ses Katya'nın kendi cümlesiyse (eko sızıntısı), yok say
-        if (isSpeaking && heardText) {
-          const katyaLow = currentKatyaSpeech.toLowerCase();
-          // Eğer gelen ses Katya'nın söylediği kelimelerin parçasıysa yankıdır
-          if (katyaLow.includes(heardText) || heardText.length < 3) {
-            return;
-          }
-          // Gerçek kullanıcı araya girdi (Barge-in): Katya'yı anında sustur
-          if (currentAudio) {
-            currentAudio.pause();
-            currentAudio = null;
-            isSpeaking = false;
-            statusText.innerText = "Dinliyorum anneciğim...";
-          }
-        }
-
         if (interim && !isSpeaking) {
           speechBox.innerText = `"${interim}"`;
         }
 
-        if (finalTranscript.trim() && !isProcessing) {
+        if (finalTranscript.trim() && !isProcessing && !isSpeaking) {
           const userMessage = finalTranscript.trim();
           speechBox.innerText = `"${userMessage}"`;
           statusText.innerText = "Düşünüyor...";
           isProcessing = true;
           
+          // Kullanıcı cümlesini bitirdiği an mikrofonu hemen sustur
+          setHardwareMicEnabled(false);
+          try { recognition.stop(); } catch(e) {}
+
           try {
             const res = await fetch("/api/voice_chat", {
               method: "POST",
@@ -528,43 +596,49 @@ LIVE_ORB_HTML = """
             });
             const data = await res.json();
             speechBox.innerText = data.reply;
-            currentKatyaSpeech = data.reply || "";
             
             if (data.audio) {
               playNeuralVoice(data.audio);
             } else {
-              isProcessing = false;
-              statusText.innerText = "Seni Dinliyor";
+              finishSpeechAndListen();
             }
           } catch (e) {
             speechBox.innerText = "Bağlantıda sorun oldu anneciğim.";
-            isProcessing = false;
-            statusText.innerText = "Seni Dinliyor";
+            finishSpeechAndListen();
           }
         }
       };
 
       recognition.onerror = (e) => {
-        if (sessionActive && e.error !== "no-speech") {
+        if (sessionActive && !isSpeaking && !isProcessing && e.error !== "no-speech") {
           setTimeout(resumeListening, 400);
         }
       };
 
       recognition.onend = () => {
         isListening = false;
-        if (sessionActive && !isProcessing) {
+        if (sessionActive && !isSpeaking && !isProcessing) {
           setTimeout(resumeListening, 200);
         }
       };
     }
 
     function resumeListening() {
-      if (sessionActive) {
+      if (sessionActive && !isSpeaking && !isProcessing) {
+        setHardwareMicEnabled(true);
         try {
           recognition.start();
-          if (!isSpeaking && !isProcessing) statusText.innerText = "Seni Dinliyor";
+          statusText.innerText = "Seni Dinliyor";
         } catch(e) {}
       }
+    }
+
+    function finishSpeechAndListen() {
+      isSpeaking = false;
+      isProcessing = false;
+      currentAudio = null;
+      // Katya'nın sesi tamamen bittikten 350 milisaniye sonra mikrofonu aç
+      setTimeout(resumeListening, 350);
     }
 
     function playNeuralVoice(base64Audio) {
@@ -578,22 +652,20 @@ LIVE_ORB_HTML = """
       isProcessing = false;
       statusText.innerText = "Katya Konuşuyor";
 
+      // Hoparlör çalışırken mikrofonu donanımdan sıfırla
+      setHardwareMicEnabled(false);
+      try { recognition.stop(); } catch(e) {}
+
       currentAudio.onended = () => {
-        isSpeaking = false;
-        currentAudio = null;
-        currentKatyaSpeech = "";
-        statusText.innerText = "Seni Dinliyor";
+        finishSpeechAndListen();
       };
 
       currentAudio.onerror = () => {
-        isSpeaking = false;
-        currentAudio = null;
-        statusText.innerText = "Seni Dinliyor";
+        finishSpeechAndListen();
       };
 
       currentAudio.play().catch(() => {
-        isSpeaking = false;
-        statusText.innerText = "Seni Dinliyor";
+        finishSpeechAndListen();
       });
     }
 
@@ -604,7 +676,7 @@ LIVE_ORB_HTML = """
       }
 
       if (!sessionActive) {
-        await initAudioHardware();
+        await initHardwareStream();
         sessionActive = true;
         speechBox.innerText = "Canlı sohbet başladı, seni dinliyorum anneciğim...";
         resumeListening();
@@ -616,7 +688,7 @@ LIVE_ORB_HTML = """
         }
         isSpeaking = false;
         isProcessing = false;
-        currentKatyaSpeech = "";
+        setHardwareMicEnabled(false);
         try { recognition.stop(); } catch(e) {}
         statusText.innerText = "Durduruldu";
         speechBox.innerText = "Sohbet durduruldu. Başlatmak için dokun.";
@@ -726,6 +798,23 @@ async def home():
 @app.get("/live", response_class=HTMLResponse)
 async def live_app():
     return HTMLResponse(content=LIVE_ORB_HTML)
+
+# Groq Whisper V3 ile sıfır hatalı ses tanıma
+@app.post("/api/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    if not groq_client:
+        return JSONResponse({"text": ""})
+    try:
+        audio_bytes = await file.read()
+        transcription = await groq_client.audio.transcriptions.create(
+            file=("audio.webm", audio_bytes, "audio/webm"),
+            model="whisper-large-v3",
+            language="tr"
+        )
+        return JSONResponse({"text": transcription.text.strip()})
+    except Exception as e:
+        log_event("ERR", f"Whisper Transcribe Hatası: {e}")
+        return JSONResponse({"text": ""})
 
 @app.post("/telegram-webhook")
 async def telegram_webhook(request: Request):
