@@ -28,23 +28,19 @@ from telegram.ext import (
 
 # --- Ortam Değişkenleri ---
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
-GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+# Virgülle ayrılmış birden fazla anahtar girilebilir: KEY1,KEY2
+RAW_KEYS = (os.getenv("GEMINI_API_KEY") or "").strip()
+API_KEYS = [k.strip() for k in RAW_KEYS.split(",") if k.strip()]
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
-# Google GenAI için v1alpha API sürümü zorunlu kılındı (404/503 hatasını çözer)
-ai_client = None
-if GEMINI_API_KEY:
-    try:
-        ai_client = genai.Client(
-            api_key=GEMINI_API_KEY,
-            http_options=types.HttpOptions(api_version="v1alpha")
-        )
-    except Exception as e:
-        print(f"[AI HATA] Gemini: {e}", flush=True)
-
-# Google'ın zorunlu kıldığı tek güncel model
 PRIMARY_MODEL = "gemini-3.8-flash"
 KATYA_VOICE = "tr-TR-EmelNeural"
+
+def get_client(api_key: str):
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(api_version="v1alpha")
+    )
 
 chat_memories = defaultdict(lambda: deque(maxlen=200))
 active_groups = {}
@@ -79,16 +75,18 @@ ALL_TOOLS = [
 ]
 
 async def execute_mother_order(order_text: str) -> str:
-    if not ai_client:
-        return "Yapay zeka beynim bağlı değil anneciğim."
+    if not API_KEYS:
+        return "Yapay zeka beynim bağlı değil anneciğim, API anahtarı bulunamadı."
 
     groups_context = "Yönettiğim Gruplar:\n" + ("\n".join([f"- {info['title']}: ID {cid}" for cid, info in active_groups.items()]) if active_groups else "Henüz bir grupta değilim.")
     prompt = f"{groups_context}\n\nAnnemin Emri: {order_text}"
 
-    # 503 geçici yoğunluk yaşanırsa 3 kez otomatik hızlı retry
-    for attempt in range(3):
+    last_error = None
+    # Mevcut tüm API anahtarlarını sırayla dener (429 kota aşımında yedek anahtara geçer)
+    for key in API_KEYS:
         try:
-            response = ai_client.models.generate_content(
+            client = get_client(key)
+            response = client.models.generate_content(
                 model=PRIMARY_MODEL,
                 contents=prompt,
                 config=types.GenerateContentConfig(
@@ -100,14 +98,14 @@ async def execute_mother_order(order_text: str) -> str:
             if response and response.text:
                 return response.text.strip()
         except Exception as e:
-            log_event("WARN", f"Gemini çağrı denemesi {attempt+1} başarısız: {e}")
-            await asyncio.sleep(0.5)
+            last_error = e
+            log_event("WARN", f"API anahtarı hata/kota aldı: {e}")
+            continue
 
-    log_event("ERR", "Gemini tüm denemelerde yanıt vermedi.")
-    return "Buradayım anneciğim, seni çok iyi duyuyorum! Ne yapmamı istersin?"
+    log_event("ERR", f"Tüm API anahtarları tükendi: {last_error}")
+    return "Bugünkü ücretsiz kullanım limitime ulaştım anneciğim, yeni bir API anahtarı eklemelisin."
 
 async def text_to_speech_base64(text: str) -> str:
-    """Doğal Türkçe kadın sesi üretip base64 formatında döner."""
     try:
         communicate = edge_tts.Communicate(text, KATYA_VOICE, rate="+8%", pitch="+4Hz")
         audio_data = bytearray()
@@ -156,7 +154,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
             log_event("ERR", f"Özel mesaj hatası: {e}")
 
 # ==========================================
-# CANLI GEMINI LIVE DENEYİMİ (HANDS-FREE + BARGE-IN)
+# CANLI GEMINI LIVE MINI APP (HANDS-FREE + BARGE-IN)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -502,7 +500,7 @@ async def lifespan(app: FastAPI):
 
             await bot_app.initialize()
             await bot_app.start()
-            # Render eski instance'ı sonlandırana kadar kısa bir pay ver
+            # Çakışmaları önlemek için başlatma gecikmesi
             await asyncio.sleep(2)
             await bot_app.updater.start_polling(drop_pending_updates=True)
             log_event("SYS", "Katya ve Canlı Mini App hazır!")
