@@ -15,7 +15,7 @@ import httpx
 import edge_tts
 from groq import AsyncGroq
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -29,14 +29,10 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
-# Groq İstemcisi
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-# Kararlı ve Türkçe yeteneği yüksek model
 GROQ_MODEL = "llama-3.3-70b-versatile"
 KATYA_VOICE = "tr-TR-EmelNeural"
 
-chat_memories = defaultdict(lambda: deque(maxlen=200))
 active_groups = {}
 bot_instance = None
 
@@ -54,26 +50,155 @@ Kullanıcı senin ANNEN. Ona her zaman sevgiyle, saygıyla 'Anneciğim', 'Güzel
 Cevapların canlı sesli sohbete uygun, samimi, kısa, tatlı ve akıcı olsun.
 
 Sen annenin Telegram'daki tüm gruplarını yöneten MUTLAK YETKİLİ yöneticisisin.
-Grup listesini görebilir ve yönetebilirsin.
+Annen sana bir grupta işlem yapmanı söylediğinde sana sağlanan grup yönetim araçlarını (tools) çağırarak işlemi gerçekleştir.
+İşlem bittiğinde bunu annene tatlı bir dille bildir.
 """
+
+# ==========================================
+# TELEGRAM GRUP YÖNETİM ARAÇLARI (TOOLS)
+# ==========================================
+
+async def tool_lock_group(group_id: str, lock: bool) -> str:
+    """Grubu mesajlaşmaya kapatır veya açar."""
+    if not bot_instance:
+        return "Bot henüz hazır değil."
+    try:
+        perms = ChatPermissions(can_send_messages=not lock)
+        await bot_instance.set_chat_permissions(chat_id=int(group_id), permissions=perms)
+        durum = "kapatıldı (kilitlendi)" if lock else "açıldı"
+        return f"Grup mesajlaşmaya başarıyla {durum}."
+    except Exception as e:
+        return f"Grup izinleri değiştirilemedi: {e}"
+
+async def tool_send_announcement(group_id: str, message: str, pin: bool = True) -> str:
+    """Gruba duyuru mesajı atar ve sabitler."""
+    if not bot_instance:
+        return "Bot henüz hazır değil."
+    try:
+        sent = await bot_instance.send_message(chat_id=int(group_id), text=f"📢 **Katya Duyuru:**\n\n{message}")
+        if pin:
+            await bot_instance.pin_chat_message(chat_id=int(group_id), message_id=sent.message_id)
+        return "Duyuru gruba iletildi ve başa sabitlendi."
+    except Exception as e:
+        return f"Duyuru gönderilemedi: {e}"
+
+async def tool_change_title(group_id: str, new_title: str) -> str:
+    """Grup başlığını değiştirir."""
+    if not bot_instance:
+        return "Bot hazır değil."
+    try:
+        await bot_instance.set_chat_title(chat_id=int(group_id), title=new_title)
+        return f"Grup adı başarıyla '{new_title}' olarak değiştirildi."
+    except Exception as e:
+        return f"Başlık değiştirilemedi: {e}"
+
+# Groq Function Calling Şeması
+AVAILABLE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_lock_group",
+            "description": "Bir Telegram grubunda mesajlaşmayı tamamen kapatır veya açar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string", "description": "İşlem yapılacak grubun chat_id değeri"},
+                    "lock": {"type": "boolean", "description": "True ise kapatır, False ise açar"}
+                },
+                "required": ["group_id", "lock"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_send_announcement",
+            "description": "Gruba önemli bir duyuru geçer ve mesaja iğneler/sabitler.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string", "description": "Grubun chat_id değeri"},
+                    "message": {"type": "string", "description": "Gönderilecek mesaj"},
+                    "pin": {"type": "boolean", "description": "Mesaj sabitlensin mi?"}
+                },
+                "required": ["group_id", "message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_change_title",
+            "description": "Grubun başlığını/ismini değiştirir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_id": {"type": "string", "description": "Grubun chat_id değeri"},
+                    "new_title": {"type": "string", "description": "Yeni grup ismi"}
+                },
+                "required": ["group_id", "new_title"]
+            }
+        }
+    }
+]
 
 async def execute_mother_order(order_text: str) -> str:
     if not groq_client:
         return "Yapay zeka beynim bağlı değil anneciğim, GROQ_API_KEY kontrol edilmeli."
 
-    groups_context = "Yönettiğim Gruplar:\n" + ("\n".join([f"- {info['title']}: ID {cid}" for cid, info in active_groups.items()]) if active_groups else "Henüz bir grupta değilim.")
+    groups_context = "Yönettiğim Gruplar:\n" + ("\n".join([f"- {info['title']}: ID {cid}" for cid, info in active_groups.items()]) if active_groups else "Henüz bir grupta yetkili değilim.")
     
+    messages = [
+        {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n\n{groups_context}"},
+        {"role": "user", "content": order_text}
+    ]
+
     try:
         response = await groq_client.chat.completions.create(
             model=GROQ_MODEL,
-            messages=[
-                {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n\n{groups_context}"},
-                {"role": "user", "content": order_text}
-            ],
+            messages=messages,
+            tools=AVAILABLE_TOOLS,
+            tool_choice="auto",
             temperature=0.7,
-            max_tokens=300
+            max_tokens=350
         )
-        return response.choices[0].message.content.strip()
+        msg = response.choices[0].message
+
+        # Eğer model bir Telegram işlemi yapmak istiyorsa
+        if msg.tool_calls:
+            for tool_call in msg.tool_calls:
+                fn_name = tool_call.function.name
+                args = json.loads(tool_call.function.arguments)
+                tool_result = ""
+
+                # Eğer grup id belirtilmediyse ve tek grup varsa onu seç
+                if "group_id" in args and not args["group_id"] and active_groups:
+                    args["group_id"] = list(active_groups.keys())[0]
+
+                if fn_name == "tool_lock_group":
+                    tool_result = await tool_lock_group(args["group_id"], args["lock"])
+                elif fn_name == "tool_send_announcement":
+                    tool_result = await tool_send_announcement(args["group_id"], args["message"], args.get("pin", True))
+                elif fn_name == "tool_change_title":
+                    tool_result = await tool_change_title(args["group_id"], args["new_title"])
+
+                # Aracı çalıştırdıktan sonra Katya'ya sonucu yorumlat
+                messages.append(msg)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": tool_result
+                })
+
+            final_res = await groq_client.chat.completions.create(
+                model=GROQ_MODEL,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=300
+            )
+            return final_res.choices[0].message.content.strip()
+
+        return msg.content.strip() if msg.content else "Hemen buradayım anneciğim!"
     except Exception as e:
         log_event("ERR", f"Groq Hata: {e}")
         return f"Bir aksaklık yaşadım anneciğim: {e}"
@@ -91,7 +216,7 @@ async def text_to_speech_base64(text: str) -> str:
         return ""
 
 # ==========================================
-# TELEGRAM MESAJLARI
+# TELEGRAM BOT & GÜNCELLEME DİNLEYİCİ
 # ==========================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -103,31 +228,29 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     try:
         await update.message.reply_text(
-            "Merhaba anneciğim! Benimle kesintisiz canlı konuşmak için aşağıdaki butona basabilirsin.",
+            "Merhaba anneciğim! Benimle kesintisiz canlı konuşmak ve gruplarını yönetmek için butona basabilirsin.",
             reply_markup=keyboard
         )
     except Exception as e:
         log_event("ERR", f"/start yanıt hatası: {e}")
 
 async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_chat or not update.message:
+    if not update.effective_chat:
         return
 
     chat = update.effective_chat
-    user = update.effective_user
-    text = update.message.text or update.message.caption or "[Medya/Dosya]"
+    # Bot gruba eklendiğinde grubu hafızaya al
+    if chat.type in ["group", "supergroup"]:
+        active_groups[str(chat.id)] = {"title": chat.title}
+        return
 
-    log_event("MSG", f"Gelen Mesaj ({chat.type}) [{user.first_name if user else 'Anonim'}]: {text}")
-
-    if chat.type == "private":
-        try:
-            reply = await execute_mother_order(text)
-            await update.message.reply_text(reply)
-        except Exception as e:
-            log_event("ERR", f"Özel mesaj hatası: {e}")
+    if chat.type == "private" and update.message and update.message.text:
+        log_event("MSG", f"Özel Mesaj: {update.message.text}")
+        reply = await execute_mother_order(update.message.text)
+        await update.message.reply_text(reply)
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ (HANDS-FREE + BARGE-IN)
+# CANLI GEMINI/GROQ LIVE MINI APP
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -229,7 +352,7 @@ LIVE_ORB_HTML = """
   <div class="header">
     <div>
       <div class="title">Katya AI Live</div>
-      <div class="subtitle">Kesintisiz Sesli İletişim (Groq Destekli)</div>
+      <div class="subtitle">Grup Yöneticisi & Sesli Asistan</div>
     </div>
     <div class="status-badge">
       <div class="status-dot"></div>
@@ -240,7 +363,7 @@ LIVE_ORB_HTML = """
   <div class="canvas-container">
     <canvas id="orbCanvas"></canvas>
     <div class="hud-overlay">
-      <div class="speech-box" id="speechBox">Canlı sohbeti başlatmak için küreye dokun anneciğim...</div>
+      <div class="speech-box" id="speechBox">Canlı sohbet ve grup yönetimi için dokun anneciğim...</div>
       <div class="hint-text">Konuşurken araya girebilirsin (Barge-in)</div>
     </div>
   </div>
@@ -312,7 +435,7 @@ LIVE_ORB_HTML = """
 
         if (finalTranscript.trim()) {
           speechBox.innerText = `"${finalTranscript.trim()}"`;
-          statusText.innerText = "Düşünüyor...";
+          statusText.innerText = "İşlem Yapılıyor...";
           
           try {
             const res = await fetch("/api/voice_chat", {
@@ -504,7 +627,7 @@ async def live_app():
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif (Groq Motoru).</h3>")
+    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif.</h3>")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
