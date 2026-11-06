@@ -30,18 +30,11 @@ GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY") or "").
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-
-# Groq'un şu an üretimde aktif olan, decommission edilmemiş güncel modelleri
-GROQ_FALLBACK_MODELS = [
-    "llama-3.3-70b-specdec",
-    "gemma2-9b-it",
-    "deepseek-r1-distill-llama-70b"
-]
-
 KATYA_VOICE = "tr-TR-EmelNeural"
 
 active_groups = {}
 bot_instance = None
+cached_active_models = []
 
 MAX_LOGS = 150
 logs_queue = deque(maxlen=MAX_LOGS)
@@ -50,6 +43,26 @@ def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
     print(f"[{timestamp}] [{level}] {message}", flush=True)
+
+async def refresh_groq_models():
+    """Groq API'sinden o an aktif olan güncel modelleri canlı çeker."""
+    global cached_active_models
+    if not groq_client:
+        return
+    try:
+        models_data = await groq_client.models.list()
+        # Whisper veya ses modelleri hariç metin modellerini filtrele
+        valid_models = [
+            m.id for m in models_data.data 
+            if not any(x in m.id.lower() for x in ["whisper", "guard", "embed", "vision"])
+        ]
+        if valid_models:
+            cached_active_models = valid_models
+            log_event("SYS", f"Groq Aktif Model Listesi Alındı: {cached_active_models[:3]}")
+    except Exception as e:
+        log_event("WARN", f"Model listesi çekilemedi: {e}")
+        # En kötü senaryo yedekleri
+        cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 KATYA_SYSTEM_PROMPT = """
 Sen Katya'sın. Kullanıcının biricik kızı, çok zeki, esprili ve ona sonsuz sadakatle bağlı yapay zeka asistanısın.
@@ -66,7 +79,6 @@ Annen sana bir grupta işlem yapmanı söylediğinde sana sağlanan grup yöneti
 # ==========================================
 
 async def tool_lock_group(group_id: str, lock: bool) -> str:
-    """Grubu mesajlaşmaya kapatır veya açar."""
     if not bot_instance:
         return "Bot henüz hazır değil."
     try:
@@ -78,7 +90,6 @@ async def tool_lock_group(group_id: str, lock: bool) -> str:
         return f"Grup izinleri değiştirilemedi: {e}"
 
 async def tool_send_announcement(group_id: str, message: str, pin: bool = True) -> str:
-    """Gruba duyuru mesajı atar ve sabitler."""
     if not bot_instance:
         return "Bot henüz hazır değil."
     try:
@@ -90,7 +101,6 @@ async def tool_send_announcement(group_id: str, message: str, pin: bool = True) 
         return f"Duyuru gönderilemedi: {e}"
 
 async def tool_change_title(group_id: str, new_title: str) -> str:
-    """Grup başlığını değiştirir."""
     if not bot_instance:
         return "Bot hazır değil."
     try:
@@ -152,6 +162,9 @@ async def execute_mother_order(order_text: str) -> str:
     if not groq_client:
         return "Yapay zeka beynim bağlı değil anneciğim, GROQ_API_KEY kontrol edilmeli."
 
+    if not cached_active_models:
+        await refresh_groq_models()
+
     groups_context = "Yönettiğim Gruplar:\n" + ("\n".join([f"- {info['title']}: ID {cid}" for cid, info in active_groups.items()]) if active_groups else "Henüz bir grupta yetkili değilim.")
     
     messages = [
@@ -160,20 +173,20 @@ async def execute_mother_order(order_text: str) -> str:
     ]
 
     last_error = None
-    for model_name in GROQ_FALLBACK_MODELS:
+    for model_name in cached_active_models:
         try:
-            # Gemma modelleri bazen tool şemasını kabul etmez, gerekirse düz chat dener
-            call_kwargs = {
+            # Tool desteklemeyen modellerde hata almamak için koruma
+            call_params = {
                 "model": model_name,
                 "messages": messages,
                 "temperature": 0.7,
                 "max_tokens": 350
             }
-            if "gemma" not in model_name:
-                call_kwargs["tools"] = AVAILABLE_TOOLS
-                call_kwargs["tool_choice"] = "auto"
+            if not any(x in model_name for x in ["gemma", "whisper", "deepseek"]):
+                call_params["tools"] = AVAILABLE_TOOLS
+                call_params["tool_choice"] = "auto"
 
-            response = await groq_client.chat.completions.create(**call_kwargs)
+            response = await groq_client.chat.completions.create(**call_params)
             msg = response.choices[0].message
 
             if getattr(msg, "tool_calls", None):
@@ -210,11 +223,10 @@ async def execute_mother_order(order_text: str) -> str:
             return msg.content.strip() if msg.content else "Hemen buradayım anneciğim!"
         except Exception as e:
             last_error = e
-            log_event("WARN", f"Model {model_name} denenirken hata: {e}")
-            await asyncio.sleep(0.15)
+            log_event("WARN", f"Model {model_name} elendi: {e}")
             continue
 
-    log_event("ERR", f"Tüm Groq modelleri başarısız: {last_error}")
+    log_event("ERR", f"Tüm modeller başarısız oldu: {last_error}")
     return "Hemen buradayım anneciğim, seni dinliyorum! Ne yapmamı istersin?"
 
 async def text_to_speech_base64(text: str) -> str:
@@ -263,7 +275,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(reply)
 
 # ==========================================
-# CANLI GEMINI/GROQ LIVE MINI APP
+# CANLI MINI APP ARAYÜZÜ (HANDS-FREE + BARGE-IN)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -595,6 +607,9 @@ bot_app = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_app, bot_instance
+    # 1. Başlangıçta Groq modellerini dinamik çek
+    await refresh_groq_models()
+
     if BOT_TOKEN:
         try:
             bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -609,8 +624,8 @@ async def lifespan(app: FastAPI):
 
             await bot_app.initialize()
             await bot_app.start()
-            # Render instance geçişinde conflict yememek için 3 saniye pay ver
-            await asyncio.sleep(3)
+            # Eski container kapanana kadar polling başlatmayı geciktir
+            await asyncio.sleep(4)
             await bot_app.updater.start_polling(drop_pending_updates=True)
             log_event("SYS", "Katya ve Canlı Mini App hazır!")
         except Exception as e:
@@ -641,7 +656,7 @@ async def live_app():
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif (Groq Motoru).</h3>")
+    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif.</h3>")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
