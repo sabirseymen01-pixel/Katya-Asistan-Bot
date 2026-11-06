@@ -31,13 +31,11 @@ RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asista
 
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Groq üzerinde 7/24 aktif, 404 vermeyen kararlı modeller
+# Groq'un şu an üretimde aktif olan, decommission edilmemiş güncel modelleri
 GROQ_FALLBACK_MODELS = [
-    "llama-3.1-70b-versatile",
-    "llama-3.1-8b-instant",
-    "llama3-70b-8192",
-    "llama3-8b-8192",
-    "mixtral-8x7b-32768"
+    "llama-3.3-70b-specdec",
+    "gemma2-9b-it",
+    "deepseek-r1-distill-llama-70b"
 ]
 
 KATYA_VOICE = "tr-TR-EmelNeural"
@@ -164,17 +162,21 @@ async def execute_mother_order(order_text: str) -> str:
     last_error = None
     for model_name in GROQ_FALLBACK_MODELS:
         try:
-            response = await groq_client.chat.completions.create(
-                model=model_name,
-                messages=messages,
-                tools=AVAILABLE_TOOLS,
-                tool_choice="auto",
-                temperature=0.7,
-                max_tokens=350
-            )
+            # Gemma modelleri bazen tool şemasını kabul etmez, gerekirse düz chat dener
+            call_kwargs = {
+                "model": model_name,
+                "messages": messages,
+                "temperature": 0.7,
+                "max_tokens": 350
+            }
+            if "gemma" not in model_name:
+                call_kwargs["tools"] = AVAILABLE_TOOLS
+                call_kwargs["tool_choice"] = "auto"
+
+            response = await groq_client.chat.completions.create(**call_kwargs)
             msg = response.choices[0].message
 
-            if msg.tool_calls:
+            if getattr(msg, "tool_calls", None):
                 for tool_call in msg.tool_calls:
                     fn_name = tool_call.function.name
                     args = json.loads(tool_call.function.arguments)
@@ -213,7 +215,7 @@ async def execute_mother_order(order_text: str) -> str:
             continue
 
     log_event("ERR", f"Tüm Groq modelleri başarısız: {last_error}")
-    return "Hemen buradayım anneciğim, seni çok iyi duyuyorum! Ne yapmamı istersin?"
+    return "Hemen buradayım anneciğim, seni dinliyorum! Ne yapmamı istersin?"
 
 async def text_to_speech_base64(text: str) -> str:
     try:
@@ -607,8 +609,8 @@ async def lifespan(app: FastAPI):
 
             await bot_app.initialize()
             await bot_app.start()
-            # Eski container kapanana kadar güvenli bekleme
-            await asyncio.sleep(2)
+            # Render instance geçişinde conflict yememek için 3 saniye pay ver
+            await asyncio.sleep(3)
             await bot_app.updater.start_polling(drop_pending_updates=True)
             log_event("SYS", "Katya ve Canlı Mini App hazır!")
         except Exception as e:
