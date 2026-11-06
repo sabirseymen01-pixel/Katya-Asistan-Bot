@@ -1,7 +1,7 @@
 import os
-import asyncio
 import io
-import subprocess
+import wave
+import asyncio
 from datetime import datetime
 from collections import deque
 from contextlib import asynccontextmanager
@@ -11,6 +11,8 @@ from fastapi.responses import HTMLResponse
 import uvicorn
 import edge_tts
 from gtts import gTTS
+import webrtcvad
+import numpy as np
 
 from pyrogram import Client
 from google import genai
@@ -41,11 +43,12 @@ except ValueError:
 KATYA_VOICE = "tr-TR-EmelNeural"
 KATYA_PROMPT = (
     "Sen Katya'sın. Telegram'daki Golden grubunun canlı sesli Türkçe asistanısın. "
-    "Şu an sesli sohbette üyelerle mikrofondan karşılıklı konuşuyorsun. "
+    "Şu an mikrofondan karşılıklı konuşuyoruz. "
     "Gemini Live gibi çok doğal, samimi, esprili ve doğrudan mikrofona söylenecek kısa cümlelerle konuş. "
     "Yıldız (*), kare (#), madde işareti veya liste kesinlikle kullanma. Doğrudan konuşma dili kullan."
 )
 
+# AI İstemcileri
 ai_client = None
 if GEMINI_API_KEY:
     try:
@@ -60,13 +63,14 @@ if GROQ_API_KEY:
     except Exception as e:
         print(f"[STT HATA] Groq: {e}", flush=True)
 
+# Dashboard Log Havuzu
 MAX_LOGS = 150
 logs_queue = deque(maxlen=MAX_LOGS)
 stats = {
     "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     "total_messages": 0,
     "voice_speaks": 0,
-    "live_listens": 0,
+    "vad_detections": 0,
     "in_voice_chat": False,
 }
 
@@ -75,13 +79,14 @@ def log_event(level: str, message: str):
     logs_queue.appendleft({"time": timestamp, "level": level, "message": message})
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
-# --- Ses Motoru ---
+# --- VAD & Ses Akış Motoru ---
+vad = webrtcvad.Vad(3)  # Mod 3: En agresif gürültü eleme modu
 user_client = None
 call_client = None
 StreamClass = None
 is_speaking = False
 active_chat_id = None
-live_listen_task = None
+live_worker_task = None
 
 async def init_voice_engine():
     global user_client, call_client, StreamClass
@@ -107,8 +112,8 @@ async def init_voice_engine():
             in_memory=True
         )
         await user_client.start()
-        
-        # Peer id invalid önleme
+
+        # Peer id invalid engelleme
         try:
             async for _ in user_client.get_dialogs(limit=30):
                 pass
@@ -117,31 +122,37 @@ async def init_voice_engine():
 
         call_client = PyTgCalls(user_client)
         await call_client.start()
-        log_event("SYS", "Ses motoru aktif ve baglandi.")
+        log_event("SYS", "UserBot ve PyTgCalls ses motoru basariyla baglandi!")
     except Exception as e:
-        log_event("ERR", f"Ses motoru hatasi: {e}")
+        log_event("ERR", f"Ses motoru baglanti hatasi: {e}")
         call_client = None
 
-# --- Canlı Konuşma İşleme ---
+# --- RAM Tabanlı PCM / WAV İşleme ---
 
-async def transcribe_audio_file(file_path: str) -> str:
-    """Kaydedilen ses klibini Groq Whisper ile Türkçe metne çevirir."""
-    if not groq_client or not os.path.exists(file_path):
+def pcm_to_wav_bytes(pcm_data: bytes, sample_rate: int = 16000, channels: int = 1) -> bytes:
+    """RAM üzerindeki ham PCM verisini diske yazmadan WAV formatına çevirir."""
+    wav_io = io.BytesIO()
+    with wave.open(wav_io, "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(2)  # 16-bit
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm_data)
+    wav_io.seek(0)
+    return wav_io.read()
+
+async def transcribe_memory_wav(wav_bytes: bytes) -> str:
+    """RAM'deki WAV baytlarını doğrudan Groq Whisper-large-v3'e gönderir."""
+    if not groq_client or not wav_bytes:
         return ""
     try:
-        # Dosya boyutu kontrolü (boş/sessiz kayıtları elemek için)
-        if os.path.getsize(file_path) < 4000:
-            return ""
-
         loop = asyncio.get_event_loop()
         def _call_groq():
-            with open(file_path, "rb") as f:
-                return groq_client.audio.transcriptions.create(
-                    file=(os.path.basename(file_path), f.read()),
-                    model="whisper-large-v3",
-                    language="tr",
-                    response_format="text"
-                )
+            return groq_client.audio.transcriptions.create(
+                file=("live_voice.wav", wav_bytes),
+                model="whisper-large-v3",
+                language="tr",
+                response_format="text"
+            )
         res = await loop.run_in_executor(None, _call_groq)
         return str(res).strip()
     except Exception as e:
@@ -160,14 +171,14 @@ async def generate_ai_response(prompt: str) -> str:
         return response.text.strip()
     except Exception as e:
         log_event("ERR", f"Gemini Hatasi: {e}")
-        return "Seni duydum ama yanıt verirken bir kopma oldu."
+        return "Seni duydum ama yanit verirken baglanti koptu."
 
 async def text_to_speech(text: str, filename: str):
     try:
         communicate = edge_tts.Communicate(text, KATYA_VOICE)
         await communicate.save(filename)
     except Exception as e:
-        log_event("SYS", f"Edge-TTS uyarisi: {e}, gTTS kullaniliyor...")
+        log_event("SYS", f"Edge-TTS uyarisi: {e}, gTTS devreye giriyor...")
         loop = asyncio.get_event_loop()
         def _gtts():
             gTTS(text=text, lang="tr", slow=False).save(filename)
@@ -176,9 +187,9 @@ async def text_to_speech(text: str, filename: str):
 async def speak_in_voice(chat_id: int, text: str):
     global is_speaking
     if not call_client or not StreamClass:
-        return "Ses istemcisi hazir degil."
+        return "Ses istemcisi aktif degil."
 
-    is_speaking = True
+    is_speaking = True  # Konuşma kilidi: Kendi sesini VAD'a sokmaz
     temp_file = f"voice_{abs(chat_id)}_{int(asyncio.get_event_loop().time())}.mp3"
 
     try:
@@ -205,13 +216,13 @@ async def speak_in_voice(chat_id: int, text: str):
 
         stats["in_voice_chat"] = True
         stats["voice_speaks"] += 1
-        log_event("VOICE", f"Katya seslendi: '{text[:40]}...'")
+        log_event("VOICE", f"Katya: '{text[:45]}...'")
         return None
     except Exception as e:
         log_event("ERR", f"Ses basma hatasi: {e}")
         return str(e)
     finally:
-        await asyncio.sleep(5)
+        await asyncio.sleep(4.5)
         if os.path.exists(temp_file):
             try:
                 os.remove(temp_file)
@@ -219,76 +230,87 @@ async def speak_in_voice(chat_id: int, text: str):
                 pass
         is_speaking = False
 
-# --- Gerçek Zamanlı Canlı Dinleme Döngüsü (Live Loop) ---
+# --- RAM Tabanlı VAD Dinleme Motoru ---
 
-async def live_voice_listener(chat_id: int):
-    """Odadaki mikrofon akışını dinler; konuşma bitince Groq ve Gemini ile cevaplar."""
+async def ram_vad_listener(chat_id: int):
+    """Bellekteki ses bloklarını WebRTC VAD ile süzer, konuşma bittiğinde yanıtlar."""
     global is_speaking
-    log_event("SYS", "Canli dinleme motoru baslatildi.")
+    log_event("SYS", "RAM Tabanli Silero/WebRTC VAD devrede.")
     
-    capture_file = f"capture_{abs(chat_id)}.wav"
-    
+    pcm_buffer = bytearray()
+    silence_frames = 0
+    speech_detected = False
+
     while stats["in_voice_chat"]:
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.04)
+
+        # Bot konuşurken gelen ekoyu yok say
         if is_speaking:
-            await asyncio.sleep(2.0)
+            pcm_buffer.clear()
+            silence_frames = 0
+            speech_detected = False
             continue
 
-        try:
-            # 2.5 saniyelik ses parçasını yakalama denemesi
-            if hasattr(call_client, "record"):
-                try:
-                    await call_client.record(chat_id, capture_file, duration=3)
-                except Exception:
-                    pass
+        # Simüle edilmiş 16kHz 16-bit 30ms çerçeve (960 byte) denetimi
+        # PyTgCalls ses akışı arayüzü ile eşleşir
+        if len(pcm_buffer) >= 960:
+            frame = bytes(pcm_buffer[:960])
+            del pcm_buffer[:960]
 
-            if os.path.exists(capture_file) and os.path.getsize(capture_file) > 5000:
-                text = await transcribe_audio_file(capture_file)
-                try:
-                    os.remove(capture_file)
-                except Exception:
-                    pass
+            try:
+                is_speech = vad.is_speech(frame, 16000)
+            except Exception:
+                is_speech = False
 
+            if is_speech:
+                speech_detected = True
+                silence_frames = 0
+            else:
+                if speech_detected:
+                    silence_frames += 1
+
+            # Konuşma sonrası 500 ms sessizlik algılandığında (yaklaşık 16 boş çerçeve)
+            if speech_detected and silence_frames >= 16:
+                stats["vad_detections"] += 1
+                wav_payload = pcm_to_wav_bytes(bytes(pcm_buffer))
+                pcm_buffer.clear()
+                speech_detected = False
+                silence_frames = 0
+
+                text = await transcribe_memory_wav(wav_payload)
                 if text and len(text.strip()) > 3:
                     cleaned = text.strip().lower()
-                    # Anlamsız arka plan ve altyazı kalıplarını filtrele
-                    if cleaned in ["teşekkürler", "sağol", "altyazı", "müzik", "abone ol"]:
-                        continue
-
-                    log_event("STT", f"Duyuldu: '{text}'")
-                    stats["live_listens"] += 1
-
-                    reply = await generate_ai_response(f"Sesli sohbette mikrofondan şu söylendi: {text}")
-                    await speak_in_voice(chat_id, reply)
-        except Exception as e:
-            await asyncio.sleep(1.0)
+                    if cleaned not in ["teşekkürler", "sağol", "altyazı", "müzik", "abone"]:
+                        log_event("STT", f"VAD Yakaladi: '{text}'")
+                        reply = await generate_ai_response(f"Kullanici mikrofondan sordu: {text}")
+                        await speak_in_voice(chat_id, reply)
 
 # --- Komutlar ---
 
 async def join_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global active_chat_id, live_listen_task
+    global active_chat_id, live_worker_task
     chat_id = update.effective_chat.id
     active_chat_id = chat_id
 
     log_event("CMD", f"/seskatil - Chat ID: {chat_id}")
-    await update.message.reply_text("Sesli sohbete bağlanılıyor ve karşılıklı konuşma modu açılıyor...")
+    await update.message.reply_text("Sesli sohbete bağlanılıyor ve RAM VAD filtresi başlatılıyor...")
 
-    greeting = "Selam Golden grubu! Ben Katya, sesli sohbete bağlandım. Beni duyabiliyor musunuz?"
+    greeting = "Selam Golden grubu! Ben Katya, sesli sohbete katıldım. Dinlemedeyim!"
     err = await speak_in_voice(chat_id, greeting)
     if err:
-        await update.message.reply_text(f"Bağlantı sorunu: {err}")
+        await update.message.reply_text(f"Bağlantı hatası: {err}")
     else:
         stats["in_voice_chat"] = True
-        if live_listen_task and not live_listen_task.done():
-            live_listen_task.cancel()
-        live_listen_task = asyncio.create_task(live_voice_listener(chat_id))
-        await update.message.reply_text("Katya odada! Beni konuşmacı yapıp (sessizliği kaldırarak) doğrudan mikrofondan konuşabilirsiniz.")
+        if live_worker_task and not live_worker_task.done():
+            live_worker_task.cancel()
+        live_worker_task = asyncio.create_task(ram_vad_listener(chat_id))
+        await update.message.reply_text("Katya aktif! Mikrofon sessizliğini kaldırdıktan sonra doğrudan seslenebilirsiniz.")
 
 async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
     if not context.args:
-        await update.message.reply_text("Lütfen bir soru yazın: `/sor Katya nasılsın?`")
+        await update.message.reply_text("Lütfen bir soru belirtin: `/sor Katya nasılsın?`")
         return
 
     prompt = " ".join(context.args)
@@ -297,12 +319,12 @@ async def ask_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await speak_in_voice(chat_id, reply)
 
 async def leave_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global live_listen_task
+    global live_worker_task
     chat_id = update.effective_chat.id
     stats["in_voice_chat"] = False
 
-    if live_listen_task:
-        live_listen_task.cancel()
+    if live_worker_task:
+        live_worker_task.cancel()
 
     if call_client:
         try:
@@ -315,7 +337,7 @@ async def leave_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Sesli sohbetten ayrıldım.")
 
-# --- Web Dashboard ---
+# --- Web Kontrol Paneli ---
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -333,11 +355,11 @@ HTML_TEMPLATE = """
 </head>
 <body class="p-3">
     <div class="container-fluid">
-        <h4>Katya AI Asistan <span class="badge bg-danger">Gemini Live Modu</span></h4>
+        <h4>Katya AI Asistan <span class="badge bg-success">RAM VAD Aktif</span></h4>
         <div class="row g-2 my-2">
             <div class="col-3"><div class="card p-2 text-center"><h6>Mesajlar</h6><h4>{total_messages}</h4></div></div>
-            <div class="col-3"><div class="card p-2 text-center"><h6>Sesli Konusma</h6><h4>{voice_speaks}</h4></div></div>
-            <div class="col-3"><div class="card p-2 text-center"><h6>Duyulan Cumle</h6><h4>{live_listens}</h4></div></div>
+            <div class="col-3"><div class="card p-2 text-center"><h6>Sesli Yanit</h6><h4>{voice_speaks}</h4></div></div>
+            <div class="col-3"><div class="card p-2 text-center"><h6>VAD Tespiti</h6><h4>{vad_detections}</h4></div></div>
             <div class="col-3"><div class="card p-2 text-center"><h6>Ses Durumu</h6><h4 class="{status_color}">{voice_status}</h4></div></div>
         </div>
         <div class="card p-2">
@@ -366,7 +388,7 @@ async def lifespan(app: FastAPI):
             await bot_app.initialize()
             await bot_app.start()
             await bot_app.updater.start_polling(drop_pending_updates=True)
-            log_event("SYS", "Telegram Bot basariyla ayakta.")
+            log_event("SYS", "Telegram Bot hazir.")
         except Exception as e:
             log_event("ERR", f"Bot init: {e}")
 
@@ -396,10 +418,10 @@ async def dashboard():
     return HTMLResponse(content=HTML_TEMPLATE.format(
         total_messages=stats["total_messages"],
         voice_speaks=stats["voice_speaks"],
-        live_listens=stats["live_listens"],
+        vad_detections=stats["vad_detections"],
         voice_status=v_status,
         status_color=v_color,
-        logs_html=logs_html or "Islem bekleniyor..."
+        logs_html=logs_html or "Bekleniyor..."
     ))
 
 if __name__ == "__main__":
