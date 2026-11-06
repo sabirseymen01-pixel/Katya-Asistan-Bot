@@ -7,7 +7,7 @@ from datetime import datetime
 from collections import deque, defaultdict
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -34,6 +34,7 @@ KATYA_VOICE = "tr-TR-EmelNeural"
 
 active_groups = {}
 bot_instance = None
+bot_app = None
 cached_active_models = []
 
 MAX_LOGS = 150
@@ -45,23 +46,20 @@ def log_event(level: str, message: str):
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 async def refresh_groq_models():
-    """Groq API'sinden o an aktif olan güncel modelleri canlı çeker."""
     global cached_active_models
     if not groq_client:
         return
     try:
         models_data = await groq_client.models.list()
-        # Whisper veya ses modelleri hariç metin modellerini filtrele
         valid_models = [
             m.id for m in models_data.data 
             if not any(x in m.id.lower() for x in ["whisper", "guard", "embed", "vision"])
         ]
         if valid_models:
             cached_active_models = valid_models
-            log_event("SYS", f"Groq Aktif Model Listesi Alındı: {cached_active_models[:3]}")
+            log_event("SYS", f"Groq Aktif Model Listesi: {cached_active_models[:3]}")
     except Exception as e:
         log_event("WARN", f"Model listesi çekilemedi: {e}")
-        # En kötü senaryo yedekleri
         cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 KATYA_SYSTEM_PROMPT = """
@@ -175,7 +173,6 @@ async def execute_mother_order(order_text: str) -> str:
     last_error = None
     for model_name in cached_active_models:
         try:
-            # Tool desteklemeyen modellerde hata almamak için koruma
             call_params = {
                 "model": model_name,
                 "messages": messages,
@@ -223,7 +220,6 @@ async def execute_mother_order(order_text: str) -> str:
             return msg.content.strip() if msg.content else "Hemen buradayım anneciğim!"
         except Exception as e:
             last_error = e
-            log_event("WARN", f"Model {model_name} elendi: {e}")
             continue
 
     log_event("ERR", f"Tüm modeller başarısız oldu: {last_error}")
@@ -242,7 +238,7 @@ async def text_to_speech_base64(text: str) -> str:
         return ""
 
 # ==========================================
-# TELEGRAM BOT & GÜNCELLEME DİNLEYİCİ
+# TELEGRAM MESAJLARI
 # ==========================================
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -275,7 +271,7 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(reply)
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ (HANDS-FREE + BARGE-IN)
+# CANLI GEMINI/GROQ LIVE MINI APP
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -602,47 +598,54 @@ LIVE_ORB_HTML = """
 class ChatPayload(BaseModel):
     message: str
 
-bot_app = None
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global bot_app, bot_instance
-    # 1. Başlangıçta Groq modellerini dinamik çek
     await refresh_groq_models()
 
     if BOT_TOKEN:
         try:
             bot_app = ApplicationBuilder().token(BOT_TOKEN).build()
             bot_instance = bot_app.bot
-            try:
-                await bot_instance.delete_webhook(drop_pending_updates=True)
-            except Exception:
-                pass
 
             bot_app.add_handler(CommandHandler("start", start_cmd))
             bot_app.add_handler(MessageHandler(filters.ALL, telegram_message_handler))
 
             await bot_app.initialize()
             await bot_app.start()
-            # Eski container kapanana kadar polling başlatmayı geciktir
-            await asyncio.sleep(4)
-            await bot_app.updater.start_polling(drop_pending_updates=True)
-            log_event("SYS", "Katya ve Canlı Mini App hazır!")
+
+            # Webhook kurulumu: Polling kaldırıldı, Conflict hatası imkansız hale getirildi
+            webhook_url = f"{RENDER_EXTERNAL_URL}/telegram-webhook"
+            await bot_instance.set_webhook(url=webhook_url, drop_pending_updates=True)
+            log_event("SYS", f"Telegram Webhook kuruldu: {webhook_url}")
         except Exception as e:
-            log_event("ERR", f"Bot başlatma hatası: {e}")
+            log_event("ERR", f"Bot webhook başlatma hatası: {e}")
 
     yield
 
     if bot_app:
         try:
-            if bot_app.updater and bot_app.updater.running:
-                await bot_app.updater.stop()
+            await bot_instance.delete_webhook(drop_pending_updates=True)
             await bot_app.stop()
             await bot_app.shutdown()
         except Exception:
             pass
 
 app = FastAPI(lifespan=lifespan)
+
+# Telegram Webhook Uç Noktası (Conflict hatasını kökten bitirir)
+@app.post("/telegram-webhook")
+async def telegram_webhook(request: Request):
+    if not bot_app:
+        return JSONResponse({"ok": False})
+    try:
+        data = await request.json()
+        update = Update.de_json(data, bot_app.bot)
+        await bot_app.process_update(update)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        log_event("ERR", f"Webhook güncelleme hatası: {e}")
+        return JSONResponse({"ok": False})
 
 @app.post("/api/voice_chat")
 async def voice_chat_endpoint(payload: ChatPayload):
@@ -656,7 +659,7 @@ async def live_app():
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif.</h3>")
+    return HTMLResponse("<h3>Katya AI Canli Sunucu Aktif (Webhook + Groq).</h3>")
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
