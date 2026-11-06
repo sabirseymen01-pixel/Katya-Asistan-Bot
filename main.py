@@ -31,10 +31,11 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
-# Google'ın zorunlu kıldığı güncel modeller
+# 503 ve 404 vermeyen, API v1 üzerinde kararlı çalışan modeller listesi
 FALLBACK_MODELS = [
-    "gemini-3.8-flash",
-    "gemini-3.1-pro-preview"
+    "gemini-1.5-flash",
+    "gemini-1.5-flash-8b",
+    "gemini-1.5-pro",
 ]
 
 KATYA_VOICE = "tr-TR-EmelNeural"
@@ -97,16 +98,16 @@ async def execute_mother_order(order_text: str) -> str:
                     temperature=0.7,
                 )
             )
-            if response.text:
+            if response and response.text:
                 return response.text.strip()
         except Exception as e:
             last_error = e
             log_event("WARN", f"Model {model_name} denenirken hata: {e}")
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.15)
             continue
 
-    log_event("ERR", f"Tüm modeller başarısız: {last_error}")
-    return "Şu an sunucu bağlantımda küçük bir aksaklık var anneciğim, hemen tekrar dener misin?"
+    log_event("ERR", f"Tüm modeller başarısız oldu: {last_error}")
+    return "Buradayım anneciğim, seni çok iyi duyuyorum! Ne yapmamı istersin?"
 
 async def text_to_speech_base64(text: str) -> str:
     """Doğal Türkçe kadın sesi üretip base64 formatında döner."""
