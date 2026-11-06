@@ -1,6 +1,7 @@
 fastapi
 uvicorn[standard]
 python-telegram-bot
-google-genai
+groq
 httpx
 edge-tts
+pydantic
