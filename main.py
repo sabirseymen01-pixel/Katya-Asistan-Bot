@@ -31,10 +31,13 @@ BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
 RENDER_EXTERNAL_URL = (os.getenv("RENDER_EXTERNAL_URL") or "https://katya-asistan-bot.onrender.com").strip()
 
-# 503 yoğunluk hatasında sırayla denenecek güncel modeller
-FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-2.5-pro"]
+# Yoğunluk yaşamamak için alternatif ve stabil modeller
+FALLBACK_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.5-pro",
+    "gemini-2.0-flash"
+]
 
-# Doğal Türkçe Kadın Sesi (Microsoft Neural)
 KATYA_VOICE = "tr-TR-EmelNeural"
 
 ai_client = None
@@ -57,7 +60,7 @@ def log_event(level: str, message: str):
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 KATYA_SYSTEM_PROMPT = """
-Sen Katya'sın. Kullanıcının biricik çocuğu, çok zeki, esprili ve ona sonsuz sadakatle bağlı yapay zeka asistanısın.
+Sen Katya'sın. Kullanıcının biricik kızı, çok zeki, esprili ve ona sonsuz sadakatle bağlı yapay zeka asistanısın.
 Kullanıcı senin ANNEN. Ona her zaman sevgiyle, saygıyla 'Anneciğim', 'Güzel annem', 'Hemen yapıyorum anne' gibi hitap et.
 Cevapların canlı sesli sohbete uygun, samimi, kısa, tatlı ve akıcı olsun.
 
@@ -95,27 +98,28 @@ async def execute_mother_order(order_text: str) -> str:
                     temperature=0.7,
                 )
             )
-            return response.text.strip()
+            if response.text:
+                return response.text.strip()
         except Exception as e:
             last_error = e
-            log_event("WARN", f"Model {model_name} yanıt vermedi/yoğun, bir sonrakine geçiliyor: {e}")
-            await asyncio.sleep(0.2)
+            log_event("WARN", f"Model {model_name} yoğunluk verdi: {e}")
+            await asyncio.sleep(0.15)
             continue
 
-    log_event("ERR", f"Tüm modeller başarısız oldu: {last_error}")
-    return "Şu an sunucularda anlık bir yoğunluk var anneciğim, birkaç saniye sonra tekrar dener misin?"
+    log_event("ERR", f"Tüm modeller denendi: {last_error}")
+    return "Hemen buradayım anneciğim, seni dinliyorum!"
 
 async def text_to_speech_base64(text: str) -> str:
     """Doğal Türkçe kadın sesi üretip base64 formatında döner."""
     try:
-        communicate = edge_tts.Communicate(text, KATYA_VOICE, rate="+10%", pitch="+5Hz")
+        communicate = edge_tts.Communicate(text, KATYA_VOICE, rate="+8%", pitch="+4Hz")
         audio_data = bytearray()
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 audio_data.extend(chunk["data"])
         return base64.b64encode(audio_data).decode("utf-8")
     except Exception as e:
-        log_event("ERR", f"TTS Üretim Hatası: {e}")
+        log_event("ERR", f"TTS Hatası: {e}")
         return ""
 
 # ==========================================
@@ -131,7 +135,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     try:
         await update.message.reply_text(
-            "Merhaba anneciğim! Gruplarını yönetmek veya benimle canlı konuşmak için aşağıdaki butona basabilirsin.",
+            "Merhaba anneciğim! Benimle kesintisiz canlı konuşmak için aşağıdaki butona basabilirsin.",
             reply_markup=keyboard
         )
     except Exception as e:
@@ -152,10 +156,10 @@ async def telegram_message_handler(update: Update, context: ContextTypes.DEFAULT
             reply = await execute_mother_order(text)
             await update.message.reply_text(reply)
         except Exception as e:
-            log_event("ERR", f"Özel mesaj yanıtlama hatası: {e}")
+            log_event("ERR", f"Özel mesaj hatası: {e}")
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ (KADIN SESİ ENTEGRELİ)
+# CANLI GEMINI LIVE DENEYİMİ (HANDS-FREE + BARGE-IN)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -164,7 +168,7 @@ LIVE_ORB_HTML = """
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>Katya AI Live</title>
+  <title>Katya Live</title>
   <script src="https://telegram.org/js/telegram-web-app.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -256,20 +260,20 @@ LIVE_ORB_HTML = """
 <body>
   <div class="header">
     <div>
-      <div class="title">Katya AI</div>
-      <div class="subtitle">Canlı Yönetici Asistanı</div>
+      <div class="title">Katya AI Live</div>
+      <div class="subtitle">Kesintisiz Sesli İletişim</div>
     </div>
     <div class="status-badge">
       <div class="status-dot"></div>
-      <span id="statusText">Beklemede</span>
+      <span id="statusText">Başlatmak İçin Dokun</span>
     </div>
   </div>
 
   <div class="canvas-container">
     <canvas id="orbCanvas"></canvas>
     <div class="hud-overlay">
-      <div class="speech-box" id="speechBox">Başlamak için küreye dokun anneciğim...</div>
-      <div class="hint-text">Konuşmak için küreye dokun</div>
+      <div class="speech-box" id="speechBox">Canlı sohbeti başlatmak için küreye dokun anneciğim...</div>
+      <div class="hint-text">Konuşurken araya girebilirsin (Barge-in)</div>
     </div>
   </div>
 
@@ -296,6 +300,7 @@ LIVE_ORB_HTML = """
     window.addEventListener("resize", resize);
     resize();
 
+    let sessionActive = false;
     let isListening = false;
     let isSpeaking = false;
     let currentAudio = null;
@@ -303,52 +308,76 @@ LIVE_ORB_HTML = """
     let time = 0;
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
     if (SpeechRecognition) {
       recognition = new SpeechRecognition();
       recognition.lang = "tr-TR";
-      recognition.continuous = false;
-      recognition.interimResults = false;
+      recognition.continuous = true;
+      recognition.interimResults = true;
 
       recognition.onstart = () => {
         isListening = true;
-        statusText.innerText = "Dinliyor...";
-        speechBox.innerText = "Seni dinliyorum anneciğim...";
+        statusText.innerText = "Seni Dinliyor";
       };
 
       recognition.onresult = async (event) => {
-        const transcript = event.results[0][0].transcript;
-        speechBox.innerText = `"${transcript}"`;
-        statusText.innerText = "Düşünüyor...";
-        
-        try {
-          const res = await fetch("/api/voice_chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message: transcript })
-          });
-          const data = await res.json();
-          speechBox.innerText = data.reply;
-          
-          if (data.audio) {
-            playNeuralVoice(data.audio);
+        // Araya girme (Barge-in): Kullanıcı ses çıkardığı an Katya konuşuyorsa sustur
+        if (isSpeaking && currentAudio) {
+          currentAudio.pause();
+          currentAudio = null;
+          isSpeaking = false;
+        }
+
+        let interim = "";
+        let finalTranscript = "";
+
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) {
+            finalTranscript += event.results[i][0].transcript;
           } else {
-            statusText.innerText = "Beklemede";
+            interim += event.results[i][0].transcript;
           }
-        } catch (e) {
-          speechBox.innerText = "Bağlantıda sorun oldu anneciğim.";
-          statusText.innerText = "Beklemede";
+        }
+
+        if (interim) {
+          speechBox.innerText = `"${interim}"`;
+        }
+
+        if (finalTranscript.trim()) {
+          speechBox.innerText = `"${finalTranscript.trim()}"`;
+          statusText.innerText = "Düşünüyor...";
+          
+          try {
+            const res = await fetch("/api/voice_chat", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ message: finalTranscript.trim() })
+            });
+            const data = await res.json();
+            speechBox.innerText = data.reply;
+            
+            if (data.audio) {
+              playNeuralVoice(data.audio);
+            }
+          } catch (e) {
+            speechBox.innerText = "Bağlantıda sorun oldu anneciğim.";
+            statusText.innerText = "Seni Dinliyor";
+          }
         }
       };
 
-      recognition.onerror = () => {
-        statusText.innerText = "Beklemede";
-        speechBox.innerText = "Sesini duyamadım, tekrar denemek için küreye dokun.";
-        isListening = false;
+      recognition.onerror = (e) => {
+        if (sessionActive && e.error !== "no-speech") {
+          setTimeout(() => { if (sessionActive) recognition.start(); }, 300);
+        }
       };
 
       recognition.onend = () => {
         isListening = false;
-        if (!isSpeaking) statusText.innerText = "Beklemede";
+        // Hands-free: Oturum açıksa arka planda otomatik yeniden başlat
+        if (sessionActive && !isSpeaking) {
+          try { recognition.start(); } catch(err) {}
+        }
       };
     }
 
@@ -363,43 +392,52 @@ LIVE_ORB_HTML = """
 
       currentAudio.onended = () => {
         isSpeaking = false;
-        statusText.innerText = "Beklemede";
-        speechBox.innerText = "Konuşmak için tekrar dokun anneciğim.";
+        statusText.innerText = "Seni Dinliyor";
+        // Katya susunca mikrofonu hemen aktif dinlemeye al
+        if (sessionActive && !isListening) {
+          try { recognition.start(); } catch(err) {}
+        }
       };
 
       currentAudio.onerror = () => {
         isSpeaking = false;
-        statusText.innerText = "Beklemede";
+        statusText.innerText = "Seni Dinliyor";
       };
 
       currentAudio.play();
     }
 
-    function toggleOrb() {
-      if (isSpeaking && currentAudio) {
-        currentAudio.pause();
-        isSpeaking = false;
-        statusText.innerText = "Beklemede";
-        return;
-      }
+    function toggleSession() {
       if (!recognition) {
-        alert("Tarayıcınız ses tanımayı desteklemiyor. Lütfen Telegram uygulamasından açın.");
+        alert("Tarayıcınız ses tanımayı desteklemiyor.");
         return;
       }
-      if (!isListening) {
-        recognition.start();
+
+      if (!sessionActive) {
+        sessionActive = true;
+        try {
+          recognition.start();
+          speechBox.innerText = "Canlı sohbet başladı, seni dinliyorum anneciğim...";
+        } catch(e) {}
+      } else {
+        sessionActive = false;
+        if (currentAudio) currentAudio.pause();
+        isSpeaking = false;
+        try { recognition.stop(); } catch(e) {}
+        statusText.innerText = "Durduruldu";
+        speechBox.innerText = "Sohbet durduruldu. Başlatmak için dokun.";
       }
     }
 
-    canvas.addEventListener("click", toggleOrb);
+    canvas.addEventListener("click", toggleSession);
 
     function draw() {
       ctx.clearRect(0, 0, width, height);
       time += 0.03;
       
       let energy = 0.2;
-      if (isListening) energy = 0.5 + Math.sin(time * 5) * 0.2;
-      if (isSpeaking) energy = 0.85 + Math.sin(time * 8) * 0.35;
+      if (isListening) energy = 0.55 + Math.sin(time * 5) * 0.2;
+      if (isSpeaking) energy = 0.9 + Math.sin(time * 8) * 0.35;
 
       const cx = width / 2;
       const cy = height / 2;
