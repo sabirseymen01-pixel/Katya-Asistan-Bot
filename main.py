@@ -12,6 +12,7 @@ from gtts import gTTS
 
 from pyrogram import Client
 from google import genai
+from groq import Groq
 
 from telegram import Update
 from telegram.ext import (
@@ -28,6 +29,7 @@ raw_api_id = (os.getenv("API_ID") or "").strip()
 API_HASH = (os.getenv("API_HASH") or "").strip()
 SESSION_STRING = (os.getenv("SESSION_STRING") or "").strip()
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or "").strip()
 
 try:
     API_ID = int(raw_api_id) if raw_api_id else 0
@@ -48,6 +50,13 @@ if GEMINI_API_KEY:
     except Exception as e:
         print(f"[AI HATA] Gemini baslatilamadi: {e}", flush=True)
 
+groq_client = None
+if GROQ_API_KEY:
+    try:
+        groq_client = Groq(api_key=GROQ_API_KEY)
+    except Exception as e:
+        print(f"[STT HATA] Groq baslatilamadi: {e}", flush=True)
+
 # Staff Paneli Havuzu
 MAX_LOGS = 150
 logs_queue = deque(maxlen=MAX_LOGS)
@@ -55,6 +64,7 @@ stats = {
     "start_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     "total_messages": 0,
     "voice_speaks": 0,
+    "voice_listens": 0,
     "in_voice_chat": False,
 }
 
@@ -68,6 +78,7 @@ def log_event(level: str, message: str):
 user_client = None
 call_client = None
 StreamClass = None
+is_speaking = False  # Bot konuşurken kendi sesini dinlemeyi engeller
 
 async def init_voice_engine():
     global user_client, call_client, StreamClass
@@ -117,6 +128,44 @@ async def init_voice_engine():
         log_event("ERR", f"KRITIK SES BAGLANTI HATASI: {type(e).__name__} - {e}")
         call_client = None
 
+# --- Canlı Dinleme & Ses Tanıma (STT) ---
+
+async def transcribe_audio_file(audio_path: str) -> str:
+    """Kaydedilen ses klibini Groq Whisper ile Türkçeye çevirir."""
+    if not groq_client or not os.path.exists(audio_path):
+        return ""
+    try:
+        loop = asyncio.get_event_loop()
+        def _call_groq():
+            with open(audio_path, "rb") as file_data:
+                res = groq_client.audio.transcriptions.create(
+                    file=(os.path.basename(audio_path), file_data.read()),
+                    model="whisper-large-v3",
+                    language="tr",
+                    response_format="text"
+                )
+            return str(res).strip()
+        text = await loop.run_in_executor(None, _call_groq)
+        return text
+    except Exception as e:
+        log_event("ERR", f"Groq STT Hatasi: {e}")
+        return ""
+
+async def process_user_speech(chat_id: int, user_text: str):
+    """Mikrofondan duyulan metni Gemini'ye verir ve odaya konuşur."""
+    global is_speaking
+    if is_speaking or not user_text:
+        return
+
+    log_event("VOICE", f"Kullanici Duyuldu: '{user_text}'")
+    stats["voice_listens"] += 1
+
+    # Katya'ya hitap edildiyse veya soru sorulduysa cevapla
+    clean_text = user_text.lower()
+    if "katya" in clean_text or "?" in clean_text or len(clean_text) > 4:
+        ai_reply = await generate_ai_response(f"Canli sesli sohbette su soylendi: {user_text}")
+        await speak_in_voice(chat_id, ai_reply)
+
 async def generate_ai_response(prompt: str) -> str:
     if not ai_client:
         return "Yapay zeka anahtarim ayarlanmamis, dinlemedeyim."
@@ -145,9 +194,11 @@ async def text_to_speech(text: str, filename: str):
         await loop.run_in_executor(None, run_gtts)
 
 async def speak_in_voice(chat_id: int, text: str):
+    global is_speaking
     if not call_client or not StreamClass:
         return "Ses istemcisi (UserBot) aktif degil. Render loglarina bakin."
 
+    is_speaking = True
     file_id = f"{abs(chat_id)}_{int(asyncio.get_event_loop().time())}"
     temp_mp3 = f"voice_{file_id}.mp3"
 
@@ -183,12 +234,13 @@ async def speak_in_voice(chat_id: int, text: str):
         log_event("ERR", f"Ses aktarim hatasi: {e}")
         return str(e)
     finally:
-        await asyncio.sleep(8)
+        await asyncio.sleep(6)
         if os.path.exists(temp_mp3):
             try:
                 os.remove(temp_mp3)
             except Exception:
                 pass
+        is_speaking = False
 
 async def leave_voice(chat_id: int):
     if call_client:
@@ -210,7 +262,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Merhaba {user.first_name}! Ben Katya.\n\n"
         "Komutlar:\n"
-        "• `/seskatil` - Odaya baglanir\n"
+        "• `/seskatil` - Odaya baglanir ve dinlemeye baslar\n"
         "• `/sor <soru>` - Yapay zeka ile sesli konusur\n"
         "• `/konus <metin>` - Dogrudan seslendirir\n"
         "• `/sesayril` - Odadan cikar"
@@ -219,14 +271,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def join_voice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     log_event("STAFF", f"Sesli odaya baglanma istendi (Chat ID: {chat_id})")
-    await update.message.reply_text("Sesli sohbete bağlanılıyor...")
+    await update.message.reply_text("Sesli sohbete bağlanılıyor ve canlı dinleme açılıyor...")
     
-    greeting = "Selam Golden grubu! Ben Katya, sesli sohbete katildim."
+    greeting = "Selam Golden grubu! Ben Katya, sesli sohbete katildim, sizi dinliyorum."
     err = await speak_in_voice(chat_id, greeting)
     if err:
         await update.message.reply_text(f"Baglanti hatasi: {err}")
     else:
-        await update.message.reply_text("Sesli sohbete baglandim!")
+        await update.message.reply_text("Sesli sohbete baglandim! Sesli odada bana doğrudan seslenebilirsiniz.")
 
 async def ask_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -295,9 +347,10 @@ HTML_TEMPLATE = """
     <div class="container-fluid">
         <h4>Katya AI Asistan <span class="badge bg-danger">Staff Panel</span></h4>
         <div class="row g-2 my-2">
-            <div class="col-4"><div class="card p-2 text-center"><h6>Mesajlar</h6><h4>{total_messages}</h4></div></div>
-            <div class="col-4"><div class="card p-2 text-center"><h6>Sesli Konusma</h6><h4>{voice_speaks}</h4></div></div>
-            <div class="col-4"><div class="card p-2 text-center"><h6>Ses Durumu</h6><h4 class="{status_color}">{voice_status}</h4></div></div>
+            <div class="col-3"><div class="card p-2 text-center"><h6>Mesajlar</h6><h4>{total_messages}</h4></div></div>
+            <div class="col-3"><div class="card p-2 text-center"><h6>Sesli Konusma</h6><h4>{voice_speaks}</h4></div></div>
+            <div class="col-3"><div class="card p-2 text-center"><h6>Dinleme</h6><h4>{voice_listens}</h4></div></div>
+            <div class="col-3"><div class="card p-2 text-center"><h6>Ses Durumu</h6><h4 class="{status_color}">{voice_status}</h4></div></div>
         </div>
         <div class="card p-2">
             <h6>Canli Loglar</h6>
@@ -358,6 +411,7 @@ async def dashboard():
     return HTMLResponse(content=HTML_TEMPLATE.format(
         total_messages=stats["total_messages"],
         voice_speaks=stats["voice_speaks"],
+        voice_listens=stats["voice_listens"],
         voice_status=v_status,
         status_color=v_color,
         logs_html=logs_html or "Kayit bekleniyor..."
