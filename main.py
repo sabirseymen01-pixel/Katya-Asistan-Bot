@@ -679,7 +679,7 @@ async def handle_telegram_update(upd: dict):
             await tg_api("sendMessage", {"chat_id": chat_id, "text": "Yalnizca kurucum Sabrina ile ozel gorusme yapabilirim."})
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ (DÖNGÜSÜZ & STABİL MİKROFON)
+# CANLI MINI APP ARAYÜZÜ (KESİNTİSİZ & DÖNGÜSÜZ)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -824,7 +824,8 @@ LIVE_ORB_HTML = """
     if (SpeechRecognition) {
       recognition = new SpeechRecognition();
       recognition.lang = "tr-TR";
-      recognition.continuous = true;
+      // KESİNTİSİZ TEKİL DÖNGÜ (Döngü spamini önleyen ayar)
+      recognition.continuous = false;
       recognition.interimResults = true;
 
       recognition.onstart = () => {
@@ -869,31 +870,38 @@ LIVE_ORB_HTML = """
       };
 
       recognition.onerror = (e) => {
-        // Hata olduğunda otomatik yeniden başlatma yapmıyoruz; izin döngüsünü kesen yer burasıdır.
-        if (e.error === "not-allowed" || e.error === "service-not-allowed") {
-          statusText.innerText = "Mikrofon Izni Gerekli";
-          speechBox.innerText = "Lutfen mikrofon erisimine izin verin.";
+        isListening = false;
+        if (e.error === "not-allowed") {
+          statusText.innerText = "Mikrofon Izni Verilmedi";
+          speechBox.innerText = "Lutfen mikrofon iznini onaylayin.";
           sessionActive = false;
         }
       };
 
       recognition.onend = () => {
         isListening = false;
-        // Sadece oturum hala aktifse ve konuşma yapılmıyorsa tek seferlik geri açılır
-        if (sessionActive && !isSpeaking && !isProcessing) {
-          try { recognition.start(); } catch(err) {}
-        }
+        // ASLA OTOMATİK START ÇAĞIRMIYORUZ! İzin spamini tamamen kesen yer burası.
       };
+    }
+
+    function safeStartListening() {
+      if (sessionActive && !isSpeaking && !isProcessing && !isListening && recognition) {
+        try {
+          recognition.start();
+          statusText.innerText = "Seni Dinliyor";
+        } catch(e) {}
+      }
     }
 
     function finishSpeaking() {
       isSpeaking = false;
       isProcessing = false;
       currentAudio = null;
-      statusText.innerText = "Seni Dinliyor";
-      if (sessionActive && !isListening) {
-        try { recognition.start(); } catch(e) {}
-      }
+      statusText.innerText = "Dinlemek Icin Dokun";
+      // Katya'nın sözü bitince sadece kullanıcı küreye dokunduğunda veya tek bir gecikmeli çağrıyla temiz geçiş
+      setTimeout(() => {
+        safeStartListening();
+      }, 500);
     }
 
     function playNeuralVoice(base64Audio) {
@@ -920,14 +928,13 @@ LIVE_ORB_HTML = """
       if (!sessionActive) {
         sessionActive = true;
         speechBox.innerText = "Canli sohbet basladi, seni dinliyorum Sabrina annecigim...";
-        statusText.innerText = "Seni Dinliyor";
-        try { recognition.start(); } catch(e) {}
+        safeStartListening();
       } else {
         sessionActive = false;
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
         isSpeaking = false;
         isProcessing = false;
-        try { recognition.stop(); } catch(e) {}
+        try { recognition.abort(); } catch(e) {}
         statusText.innerText = "Durduruldu";
         speechBox.innerText = "Sohbet durduruldu. Baslatmak icin dokun.";
       }
@@ -1036,4 +1043,5 @@ async def voice_chat_endpoint(payload: ChatPayload):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)get("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
