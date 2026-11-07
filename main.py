@@ -679,7 +679,7 @@ async def handle_telegram_update(upd: dict):
             await tg_api("sendMessage", {"chat_id": chat_id, "text": "Yalnizca kurucum Sabrina ile ozel gorusme yapabilirim."})
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ (KESİNTİSİZ MİKROFON KİLİTLİ)
+# CANLI MINI APP ARAYÜZÜ (DÖNGÜSÜZ & STABİL MİKROFON)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -817,7 +817,6 @@ LIVE_ORB_HTML = """
     let isProcessing = false;
     let currentAudio = null;
     let recognition = null;
-    let mediaStreamLock = null;
     let time = 0;
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -870,20 +869,19 @@ LIVE_ORB_HTML = """
       };
 
       recognition.onerror = (e) => {
-        if (e.error === "no-speech") return;
-        if (sessionActive && !isSpeaking && !isProcessing) {
-          setTimeout(() => {
-            try { recognition.start(); } catch(err) {}
-          }, 400);
+        // Hata olduğunda otomatik yeniden başlatma yapmıyoruz; izin döngüsünü kesen yer burasıdır.
+        if (e.error === "not-allowed" || e.error === "service-not-allowed") {
+          statusText.innerText = "Mikrofon Izni Gerekli";
+          speechBox.innerText = "Lutfen mikrofon erisimine izin verin.";
+          sessionActive = false;
         }
       };
 
       recognition.onend = () => {
         isListening = false;
+        // Sadece oturum hala aktifse ve konuşma yapılmıyorsa tek seferlik geri açılır
         if (sessionActive && !isSpeaking && !isProcessing) {
-          setTimeout(() => {
-            try { recognition.start(); } catch(err) {}
-          }, 200);
+          try { recognition.start(); } catch(err) {}
         }
       };
     }
@@ -893,7 +891,7 @@ LIVE_ORB_HTML = """
       isProcessing = false;
       currentAudio = null;
       statusText.innerText = "Seni Dinliyor";
-      if (sessionActive) {
+      if (sessionActive && !isListening) {
         try { recognition.start(); } catch(e) {}
       }
     }
@@ -920,15 +918,6 @@ LIVE_ORB_HTML = """
       }
 
       if (!sessionActive) {
-        // İZNİ İLK DOKUNUŞTA ALIP OTURUMA KİLİTLEME
-        try {
-          if (!mediaStreamLock && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-            mediaStreamLock = await navigator.mediaDevices.getUserMedia({ audio: true });
-          }
-        } catch(err) {
-          console.warn("Mikrofon donanim izni alinamadi:", err);
-        }
-
         sessionActive = true;
         speechBox.innerText = "Canli sohbet basladi, seni dinliyorum Sabrina annecigim...";
         statusText.innerText = "Seni Dinliyor";
@@ -936,10 +925,6 @@ LIVE_ORB_HTML = """
       } else {
         sessionActive = false;
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-        if (mediaStreamLock) {
-          mediaStreamLock.getTracks().forEach(track => track.stop());
-          mediaStreamLock = null;
-        }
         isSpeaking = false;
         isProcessing = false;
         try { recognition.stop(); } catch(e) {}
