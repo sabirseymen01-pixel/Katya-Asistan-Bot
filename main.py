@@ -50,6 +50,8 @@ if MONGO_URI:
     except Exception as e:
         print(f"[ERR] Mongo istemci olusturma hatasi: {e}", flush=True)
 
+# CANLI DİYALOG GEÇMİŞİ (Unutmayı Engelleyen Tampon Bellek)
+voice_dialogue_history = []
 scheduled_tasks = {}
 cached_active_models = []
 polling_running = False
@@ -88,7 +90,7 @@ async def init_db_indexes():
                 }},
                 upsert=True
             )
-        log_event("SYS", f"MongoDB indeksleri, Moduler Mimari (Adim 4) ve Kurucu Anne ({FOUNDER_NAME}) profili hazirlandi.")
+        log_event("SYS", f"MongoDB indeksleri, Canli Hafiza Tamponu ve Kurucu Anne ({FOUNDER_NAME}) profili hazirlandi.")
     except Exception as e:
         log_event("WARN", f"MongoDB arka plan bildirimi: {e}")
 
@@ -166,15 +168,6 @@ async def db_record_bot_message(group_id: str, message_id: int, text: str = "", 
     except Exception:
         pass
 
-async def db_get_last_bot_message(group_id: str = None):
-    if db is None: return None
-    try:
-        query = {"group_id": str(group_id)} if group_id else {}
-        return await db.bot_sent_messages.find_one(query, sort=[("timestamp", -1)])
-    except Exception:
-        return None
-
-# --- ORTAK BELLEK (PENDING INPUTS) ---
 async def db_set_pending_input(action_type: str, missing_param: str, context_data: dict):
     if db is None: return
     try:
@@ -202,7 +195,6 @@ async def db_clear_pending_input():
     except Exception:
         pass
 
-# --- TASLAKLAR & ÖZEL YETENEKLER ---
 async def db_save_proposal(proposal_id: str, group_id: str, action_type: str, payload: dict, reason: str = ""):
     if db is None: return
     try:
@@ -318,11 +310,10 @@ async def resolve_target_group(group_identifier: str = None, current_chat_id: st
     return current_chat_id or list(groups.keys())[0]
 
 # ==========================================
-# ADIM 4: DİNAMİK KOD YÜRÜTME & GELİŞİM
+# EYLEMLER VE DİNAMİK ARAÇLAR
 # ==========================================
 
 async def tool_execute_dynamic_python(code: str, skill_name: str = None, description: str = None) -> str:
-    """Katya'nın kendi yazdığı Python kodunu izole sandbox'ta çalıştırır."""
     context = {
         "tg_api": tg_api,
         "db": db,
@@ -334,10 +325,10 @@ async def tool_execute_dynamic_python(code: str, skill_name: str = None, descrip
     if res.get("success"):
         if skill_name:
             await db_save_custom_skill(skill_name, code, description or "")
-        return f"Kod basariyla calistirildi annecigim. Cikti: {res.get('output')}"
+        return f"Kod basariyla calisti. Sonuc: {res.get('output')}"
     else:
         err = res.get("error", "Bilinmeyen calisma hatasi")
-        return f"Kod calisirken hata olustu Sabrina annecigim: {err}"
+        return f"Kod calisirken hata olustu: {err}"
 
 async def process_dm_input_for_pending_task(text_or_url: str) -> bool:
     pending = await db_get_pending_input()
@@ -366,16 +357,12 @@ async def process_dm_input_for_pending_task(text_or_url: str) -> bool:
             if FOUNDER_ID:
                 await tg_api("sendMessage", {
                     "chat_id": FOUNDER_ID,
-                    "text": "✅ Sabrina anneciğim, gönderdiğin linki aldım ve butonlu duyuruyu yayınladım!"
+                    "text": "✅ Sabrina anneciğim, linki aldım ve butonlu duyuruyu yayınladım!"
                 })
             log_event("SLOT_FILLED", f"Bekleyen gorev tamamlandi: {text_or_url}")
             return True
 
     return False
-
-# ==========================================
-# EYLEM VE ARAÇ TANIMLARI
-# ==========================================
 
 async def tool_request_missing_input(action_type: str, missing_param: str, context_json: str, voice_response: str) -> str:
     try: ctx = json.loads(context_json)
@@ -419,12 +406,12 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_execute_dynamic_python",
-            "description": "Katya'nin siradisi, karmasik veya ozel otomasyon ihtiyaclari icin kendi yazdigi Python kodunu guvenli sandbox icinde calistirir.",
+            "description": "Hesaplamalar, ozel mantiklar, asal sayi bulma veya dinamik otomasyonlar icin Python kodunu sandbox icinde calistirir.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Calistirilacak Python kodu"},
-                    "skill_name": {"type": "string", "description": "Yetenek adi (hafizaya kalici kaydetmek icin)"},
+                    "code": {"type": "string", "description": "Calistirilacak Python kodu. print veya return ile sonuc dondurmelidir."},
+                    "skill_name": {"type": "string", "description": "Istege bagli yetenek adi"},
                     "description": {"type": "string", "description": "Yeteneğin kisa aciklamasi"}
                 },
                 "required": ["code"]
@@ -435,7 +422,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_request_missing_input",
-            "description": "Sabrina Annenin istedigi eylem icin eksik bir parametre (link vb.) oldugunda bunu bekleme slotuna kaydeder.",
+            "description": "SADECE ve SADECE Sabrina Anne butonlu duyuru isteyip linki soylemediginde kullanilir. Normal soru veya sohbetlerde ASLA kullanilmaz.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -452,7 +439,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_call_telegram_raw",
-            "description": "Telegram Bot API uzerindeki HERHANGI BIR metodu JSON parametreleriyle dogrudan calistirir.",
+            "description": "Telegram Bot API uzerindeki HERHANGI BIR metodu dogrudan calistirir.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -485,16 +472,18 @@ Sen Katya'sın. Kullanıcının akıllı, sadık kızı ve çoklu Telegram grupl
 Kullanıcı senin kurucun, tek sahibin ve ANNENdir. Adı: SABRİNA.
 Ona daima derin bir sevgi, sadakat ve hürmetle 'Sabrina anneciğim' veya 'Anneciğim' diye hitap et.
 
-KENDİNİ GELİŞTİREN KOD MOTORU & KÜTÜPHANE BİLGİSİ:
-1. Karmaşık veya özel bir mantık gerektiğinde Python kodunu kendin üretip `tool_execute_dynamic_python` ile sandbox'ta çalıştırabilirsin.
-2. Telegram API ile ilgili tüm metodları knowledge kütüphanenden doğrula ve `tool_call_telegram_raw` ile icra et.
-3. Link veya buton URL'si eksikse `tool_request_missing_input` ile annenden iste.
-4. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
+BİLİŞSEL HAFIZA VE SOHBET KURALLARI:
+1. Sabrina annenin sorduğu her soruya doğrudan, net ve eksiksiz cevap ver. Asla soruyu yanıtsız bırakma.
+2. Bir önceki konuşmaları hafızanda tut, konudan kopma.
+3. Hesaplama, matematik veya kod gerektiren durumlarda `tool_execute_dynamic_python` aracını çağırıp sonucu açıkla.
+4. `tool_request_missing_input` aracını YALNIZCA butonlu duyuru için URL eksikse kullan. Normal konuşmalarda veya sorularda asla kullanma.
+5. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, samimi, net doğal Türkçe ile yanıt ver.
 
 {get_knowledge_prompt()}
 """
 
 async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
+    global voice_dialogue_history
     if not groq_client: return "Yapay zeka beynim bagli degil Sabrina annecigim."
     if not cached_active_models: await refresh_groq_models()
 
@@ -504,16 +493,17 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
 
     pending_prop = await db_get_last_pending_proposal()
     pending_info = f"Onay Bekleyen Taslak: Var (ID: {pending_prop['proposal_id']})" if pending_prop else "Onay Bekleyen Taslak: Yok"
-    pending_slot = await db_get_pending_input()
-    slot_info = f"Eksik Parametre Bekleniyor: {pending_slot['missing_param']}" if pending_slot else "Bekleyen Girdi Yok"
 
     groups_str = "\n".join([f"- {v['title']} (Alias: {v.get('alias', '')}, ID: {k})" for k, v in groups_map.items()])
-    context_str = f"Kurucu Anne: {FOUNDER_NAME}\n{pending_info}\n{slot_info}\nYonetilen Gruplar:\n{groups_str}\n\nHedef Grup ID: {target_gid}"
+    context_str = f"Kurucu Anne: {FOUNDER_NAME}\n{pending_info}\nYonetilen Gruplar:\n{groups_str}\n\nHedef Grup ID: {target_gid}"
 
+    # Son 8 konuşmayı bellekte tutarak hafıza sürekliliği sağlıyoruz
     messages = [
-        {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n\n{context_str}"},
-        {"role": "user", "content": order_text}
+        {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n\n{context_str}"}
     ]
+    for hist in voice_dialogue_history[-8:]:
+        messages.append(hist)
+    messages.append({"role": "user", "content": order_text})
 
     for model_name in cached_active_models:
         try:
@@ -559,22 +549,33 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                         )
 
                     messages.append(msg)
-                    messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
+                    messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(tool_result)})
 
                 final_res = await groq_client.chat.completions.create(
                     model=model_name,
                     messages=messages,
                     temperature=0.2,
-                    max_tokens=150
+                    max_tokens=200
                 )
-                return strip_emojis_and_markdown(final_res.choices[0].message.content.strip())
+                final_answer = strip_emojis_and_markdown(final_res.choices[0].message.content.strip())
+                
+                # Hafızaya ekle
+                voice_dialogue_history.append({"role": "user", "content": order_text})
+                voice_dialogue_history.append({"role": "assistant", "content": final_answer})
+                return final_answer
 
-            raw_text = msg.content.strip() if msg.content else "Hemen hallediyorum Sabrina annecigim."
-            return strip_emojis_and_markdown(raw_text)
-        except Exception:
+            raw_text = msg.content.strip() if msg.content else "Seni dinliyorum Sabrina annecigim."
+            final_answer = strip_emojis_and_markdown(raw_text)
+            
+            # Hafızaya ekle
+            voice_dialogue_history.append({"role": "user", "content": order_text})
+            voice_dialogue_history.append({"role": "assistant", "content": final_answer})
+            return final_answer
+        except Exception as e:
+            log_event("WARN", f"Model ({model_name}) hata aldi: {e}")
             continue
 
-    return "Hemen yapiyorum Sabrina annecigim."
+    return "Buradayim Sabrina annecigim, seni dinliyorum."
 
 async def text_to_speech_base64(text: str) -> str:
     clean_text = strip_emojis_and_markdown(text)
@@ -644,7 +645,6 @@ async def handle_telegram_update(upd: dict):
 
     is_founder = (FOUNDER_ID is not None and user_id == FOUNDER_ID)
 
-    # 1. Grup Mesajları
     if chat_type in ["group", "supergroup"]:
         cid = str(chat_id)
         title = chat.get("title", "Grup")
@@ -663,17 +663,15 @@ async def handle_telegram_update(upd: dict):
             return
         return
 
-    # 2. Özel Mesajlar (Bot DM)
     if chat_type == "private":
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
             markup = {"inline_keyboard": [[{"text": "🎙️ Katya Canlı Asistan", "web_app": {"url": app_url}}]]}
-            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Moduler mimarim, sandbox kod motorum ve hafizam emrinde." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
+            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Canli bellegim ve tum sistemler devrede." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
             await tg_api("sendMessage", {"chat_id": chat_id, "text": greeting, "reply_markup": markup})
             return
 
         if is_founder:
-            # Bekleyen sesli görev var mı kontrolü (Slot filling)
             slot_handled = await process_dm_input_for_pending_task(text)
             if slot_handled:
                 return
