@@ -663,7 +663,7 @@ async def handle_telegram_update(upd: dict):
             await tg_api("sendMessage", {"chat_id": chat_id, "text": "Yalnizca kurucum Sabrina ile ozel gorusme yapabilirim."})
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ (MEDIARECORDER - KESİNTİSİZ TEK İZİN)
+# CANLI MINI APP (HANDS-FREE VAD & SİMLİ MOR-PEMBE ORB)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -691,27 +691,28 @@ LIVE_ORB_HTML = """
       display: flex;
       justify-content: space-between;
       align-items: center;
-      background: rgba(14, 8, 22, 0.6);
+      background: rgba(18, 6, 26, 0.75);
       backdrop-filter: blur(20px);
-      border-bottom: 1px solid rgba(255, 45, 120, 0.15);
+      border-bottom: 1px solid rgba(236, 72, 153, 0.25);
       z-index: 10;
     }
-    .title { font-size: 17px; font-weight: 700; color: #ff2d78; }
-    .subtitle { font-size: 11px; color: #f472b6; }
+    .title { font-size: 17px; font-weight: 700; color: #f43f5e; text-shadow: 0 0 10px rgba(244, 63, 94, 0.5); }
+    .subtitle { font-size: 11px; color: #e879f9; }
     .status-badge {
       font-size: 12px;
-      padding: 4px 10px;
+      padding: 4px 12px;
       border-radius: 20px;
-      background: rgba(157, 0, 255, 0.2);
-      border: 1px solid rgba(157, 0, 255, 0.4);
-      color: #e879f9;
+      background: rgba(168, 85, 247, 0.25);
+      border: 1px solid rgba(236, 72, 153, 0.5);
+      color: #f5d0fe;
       display: flex;
       align-items: center;
       gap: 6px;
+      box-shadow: 0 0 12px rgba(217, 70, 239, 0.25);
     }
     .status-dot {
-      width: 7px; height: 7px; border-radius: 50%; background: #ff007f;
-      box-shadow: 0 0 8px #ff007f;
+      width: 7px; height: 7px; border-radius: 50%; background: #ec4899;
+      box-shadow: 0 0 10px #ec4899, 0 0 16px #a855f7;
       animation: pulse 1.8s infinite;
     }
     @keyframes pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(0.85); } }
@@ -735,16 +736,16 @@ LIVE_ORB_HTML = """
       pointer-events: none;
     }
     .speech-box {
-      background: rgba(22, 10, 36, 0.85);
+      background: rgba(26, 10, 42, 0.88);
       backdrop-filter: blur(16px);
-      border: 1px solid rgba(255, 45, 120, 0.3);
+      border: 1px solid rgba(236, 72, 153, 0.4);
       border-radius: 16px;
       padding: 14px 20px;
       text-align: center;
       max-width: 90%;
       font-size: 14px;
-      color: #fce7f3;
-      box-shadow: 0 8px 32px rgba(157, 0, 255, 0.2);
+      color: #fdf4ff;
+      box-shadow: 0 8px 32px rgba(168, 85, 247, 0.25), 0 0 12px rgba(236, 72, 153, 0.15);
       min-height: 52px;
       display: flex;
       align-items: center;
@@ -761,14 +762,14 @@ LIVE_ORB_HTML = """
     </div>
     <div class="status-badge">
       <div class="status-dot"></div>
-      <span id="statusText">Konusmak Icin Basili Tut</span>
+      <span id="statusText">Hands-Free Baslat</span>
     </div>
   </div>
 
   <div class="canvas-container">
     <canvas id="orbCanvas"></canvas>
     <div class="hud-overlay">
-      <div class="speech-box" id="speechBox">Kureye basili tut ve konus Sabrina annecigim...</div>
+      <div class="speech-box" id="speechBox">Hands-Free sohbeti baslatmak icin 1 kez dokun Sabrina annecigim...</div>
     </div>
   </div>
 
@@ -795,37 +796,111 @@ LIVE_ORB_HTML = """
     window.addEventListener("resize", resize);
     resize();
 
+    let sessionActive = false;
+    let isSpeaking = false;
+    let isProcessing = false;
+    let isUserTalking = false;
+
     let mediaStream = null;
+    let audioContext = null;
+    let analyser = null;
+    let microphoneNode = null;
     let mediaRecorder = null;
     let audioChunks = [];
-    let isRecording = false;
-    let isSpeaking = false;
     let currentAudio = null;
     let time = 0;
 
-    // Mikrofon akışını ilk seferde alıp arka planda açık tutuyoruz (Kalıcı Kilit)
-    async function ensureMicAccess() {
-      if (!mediaStream) {
-        try {
-          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        } catch(err) {
-          statusText.innerText = "Mikrofon Izni Verilmedi";
-          speechBox.innerText = "Lutfen mikrofon erisimine izin verin.";
-          return false;
-        }
-      }
-      return true;
+    // Sim / Parıltı (Sparkle) Tanımı
+    const sparkles = [];
+    const NUM_SPARKLES = 45;
+    for (let i = 0; i < NUM_SPARKLES; i++) {
+      sparkles.push({
+        angle: Math.random() * Math.PI * 2,
+        dist: 30 + Math.random() * 110,
+        speed: 0.005 + Math.random() * 0.015,
+        size: 0.8 + Math.random() * 2.2,
+        alpha: Math.random(),
+        pulseSpeed: 0.02 + Math.random() * 0.04,
+        color: Math.random() > 0.4 ? "#f472b6" : (Math.random() > 0.5 ? "#c084fc" : "#ffffff")
+      });
     }
 
-    async function startRecording() {
-      if (isSpeaking) return;
-      const ok = await ensureMicAccess();
-      if (!ok) return;
+    const VOLUME_THRESHOLD = 18;
+    const SILENCE_TIMEOUT = 1200;
+    let silenceTimer = null;
 
+    async function initHandsFreeEngine() {
+      try {
+        mediaStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          }
+        });
+
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.4;
+
+        microphoneNode = audioContext.createMediaStreamSource(mediaStream);
+        microphoneNode.connect(analyser);
+
+        sessionActive = true;
+        statusText.innerText = "Seni Dinliyor (Hands-Free)";
+        speechBox.innerText = "Hands-free devrede, istedigin an konusabilirsin Sabrina annecigim...";
+
+        listenVolumeLoop();
+      } catch (err) {
+        statusText.innerText = "Mikrofon Izni Gerekli";
+        speechBox.innerText = "Lutfen mikrofon iznini onaylayin.";
+        sessionActive = false;
+      }
+    }
+
+    function listenVolumeLoop() {
+      if (!sessionActive) return;
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      analyser.getByteFrequencyData(dataArray);
+
+      let sum = 0;
+      for (let i = 0; i < dataArray.length; i++) {
+        sum += dataArray[i];
+      }
+      const averageVolume = sum / dataArray.length;
+
+      if (!isSpeaking && !isProcessing) {
+        if (averageVolume > VOLUME_THRESHOLD) {
+          if (!isUserTalking) {
+            onSpeechStart();
+          }
+          if (silenceTimer) {
+            clearTimeout(silenceTimer);
+            silenceTimer = null;
+          }
+        } else {
+          if (isUserTalking && !silenceTimer) {
+            silenceTimer = setTimeout(() => {
+              onSpeechEnd();
+            }, SILENCE_TIMEOUT);
+          }
+        }
+      }
+
+      requestAnimationFrame(listenVolumeLoop);
+    }
+
+    function onSpeechStart() {
+      isUserTalking = true;
       audioChunks = [];
+      statusText.innerText = "Konusuyorsun...";
+      speechBox.innerText = "Dinliyorum Sabrina annecigim...";
+
       try {
         mediaRecorder = new MediaRecorder(mediaStream, { mimeType: 'audio/webm' });
-      } catch(e) {
+      } catch (e) {
         mediaRecorder = new MediaRecorder(mediaStream);
       }
 
@@ -833,61 +908,58 @@ LIVE_ORB_HTML = """
         if (e.data.size > 0) audioChunks.push(e.data);
       };
 
-      mediaRecorder.onstop = async () => {
-        isRecording = false;
-        statusText.innerText = "Islem Yapiliyor...";
-        speechBox.innerText = "Katya dinledi, cevap hazirlaniyor...";
-
-        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
-        if (audioBlob.size < 1000) {
-          statusText.innerText = "Konusmak Icin Dokun";
-          speechBox.innerText = "Cok kisa oldu, tekrar dene Sabrina annecigim.";
-          return;
-        }
-
-        const formData = new FormData();
-        formData.append("audio_file", audioBlob, "speech.webm");
-
-        try {
-          const res = await fetch("/api/voice_stream", {
-            method: "POST",
-            body: formData
-          });
-          const data = await res.json();
-          speechBox.innerText = data.reply;
-          if (data.audio) playNeuralVoice(data.audio);
-          else finishSpeaking();
-        } catch(err) {
-          speechBox.innerText = "Baglantida sorun oldu Sabrina annecigim.";
-          finishSpeaking();
-        }
-      };
-
+      mediaRecorder.onstop = sendVoiceToKatya;
       mediaRecorder.start();
-      isRecording = true;
-      statusText.innerText = "Seni Dinliyor";
-      speechBox.innerText = "Dinliyorum Sabrina annecigim, konusman bitince tekrar dokun...";
     }
 
-    function stopRecording() {
-      if (mediaRecorder && isRecording) {
+    function onSpeechEnd() {
+      isUserTalking = false;
+      silenceTimer = null;
+      if (mediaRecorder && mediaRecorder.state === "recording") {
         mediaRecorder.stop();
       }
     }
 
-    function toggleRecording() {
-      if (isSpeaking) return;
-      if (!isRecording) {
-        startRecording();
-      } else {
-        stopRecording();
+    async function sendVoiceToKatya() {
+      if (audioChunks.length === 0) return;
+
+      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      if (audioBlob.size < 1200) {
+        statusText.innerText = "Seni Dinliyor (Hands-Free)";
+        return;
+      }
+
+      isProcessing = true;
+      statusText.innerText = "Islem Yapiliyor...";
+      speechBox.innerText = "Katya dinledi, cevap hazirlaniyor...";
+
+      const formData = new FormData();
+      formData.append("audio_file", audioBlob, "speech.webm");
+
+      try {
+        const res = await fetch("/api/voice_stream", {
+          method: "POST",
+          body: formData
+        });
+        const data = await res.json();
+        speechBox.innerText = data.reply;
+        if (data.audio) {
+          playNeuralVoice(data.audio);
+        } else {
+          finishSpeaking();
+        }
+      } catch (err) {
+        speechBox.innerText = "Baglanti hatasi olustu Sabrina annecigim.";
+        finishSpeaking();
       }
     }
 
     function finishSpeaking() {
       isSpeaking = false;
+      isProcessing = false;
+      isUserTalking = false;
       currentAudio = null;
-      statusText.innerText = "Konusmak Icin Dokun";
+      statusText.innerText = "Seni Dinliyor (Hands-Free)";
     }
 
     function playNeuralVoice(base64Audio) {
@@ -897,6 +969,7 @@ LIVE_ORB_HTML = """
       }
       currentAudio = new Audio("data:audio/mp3;base64," + base64Audio);
       isSpeaking = true;
+      isProcessing = false;
       statusText.innerText = "Katya Konusuyor";
 
       currentAudio.onended = () => { finishSpeaking(); };
@@ -904,35 +977,90 @@ LIVE_ORB_HTML = """
       currentAudio.play().catch(() => { finishSpeaking(); });
     }
 
-    canvas.addEventListener("click", toggleRecording);
+    async function toggleSession() {
+      if (!sessionActive) {
+        await initHandsFreeEngine();
+      } else {
+        sessionActive = false;
+        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        if (mediaStream) {
+          mediaStream.getTracks().forEach(t => t.stop());
+          mediaStream = null;
+        }
+        if (audioContext) {
+          audioContext.close();
+          audioContext = null;
+        }
+        isSpeaking = false;
+        isProcessing = false;
+        isUserTalking = false;
+        statusText.innerText = "Durduruldu";
+        speechBox.innerText = "Hands-Free durduruldu. Baslatmak icin 1 kez dokun.";
+      }
+    }
+
+    canvas.addEventListener("click", toggleSession);
 
     function draw() {
       ctx.clearRect(0, 0, width, height);
       time += 0.03;
-      let energy = 0.2;
-      if (isRecording) energy = 0.65 + Math.sin(time * 6) * 0.25;
+      let energy = 0.22;
+      if (isUserTalking) energy = 0.75 + Math.sin(time * 6) * 0.25;
       if (isSpeaking) energy = 0.95 + Math.sin(time * 8) * 0.35;
 
       const cx = width / 2;
       const cy = height / 2;
       const r = 90 * (1 + energy * 0.35);
 
-      const glow = ctx.createRadialGradient(cx, cy, r * 0.3, cx, cy, r * 2.2);
-      glow.addColorStop(0, isSpeaking ? "rgba(255, 0, 127, 0.6)" : (isRecording ? "rgba(0, 255, 180, 0.5)" : "rgba(157, 0, 255, 0.4)"));
+      // Dış Parıltı Halesi (Glow)
+      const glow = ctx.createRadialGradient(cx, cy, r * 0.2, cx, cy, r * 2.3);
+      if (isSpeaking) {
+        glow.addColorStop(0, "rgba(244, 63, 94, 0.65)");    // Canlı Fuşya Pembe
+        glow.addColorStop(0.5, "rgba(168, 85, 247, 0.35)"); // Mor
+      } else if (isUserTalking) {
+        glow.addColorStop(0, "rgba(236, 72, 153, 0.7)");   // Parlak Pembe
+        glow.addColorStop(0.5, "rgba(192, 132, 252, 0.45)");// Açık Lila
+      } else {
+        glow.addColorStop(0, "rgba(147, 51, 234, 0.4)");   // Derin Mor
+        glow.addColorStop(0.5, "rgba(244, 114, 182, 0.2)"); // Yumuşak Pembe
+      }
       glow.addColorStop(1, "rgba(6, 4, 10, 0)");
       ctx.fillStyle = glow;
       ctx.beginPath();
-      ctx.arc(cx, cy, r * 2.2, 0, Math.PI * 2);
+      ctx.arc(cx, cy, r * 2.3, 0, Math.PI * 2);
       ctx.fill();
 
+      // Simli Parçacıklar (Glitter Sparkles)
+      for (let s of sparkles) {
+        s.angle += s.speed * (1 + energy * 1.5);
+        s.alpha += Math.sin(time * 4) * s.pulseSpeed;
+        const currentAlpha = Math.max(0.15, Math.min(0.95, Math.abs(Math.sin(s.alpha))));
+
+        const sx = cx + Math.cos(s.angle) * (r * 0.8 + s.dist * (0.5 + energy * 0.5));
+        const sy = cy + Math.sin(s.angle) * (r * 0.8 + s.dist * (0.5 + energy * 0.5));
+
+        ctx.save();
+        ctx.fillStyle = s.color;
+        ctx.globalAlpha = currentAlpha;
+        ctx.shadowColor = "#f472b6";
+        ctx.shadowBlur = 6;
+        ctx.beginPath();
+        ctx.arc(sx, sy, s.size * (0.8 + energy * 0.4), 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // 3 Katmanlı Mor-Pembe Enerji Dalgaları
       for (let layer = 0; layer < 3; layer++) {
         ctx.beginPath();
-        ctx.strokeStyle = layer % 2 === 0 ? "rgba(255, 45, 120, 0.8)" : "rgba(157, 0, 255, 0.8)";
-        ctx.lineWidth = 2.5;
+        ctx.strokeStyle = layer === 0 ? "rgba(244, 63, 94, 0.9)" : (layer === 1 ? "rgba(217, 70, 239, 0.85)" : "rgba(168, 85, 247, 0.85)");
+        ctx.lineWidth = 2.4;
+        ctx.shadowColor = "#ec4899";
+        ctx.shadowBlur = 8;
         const pts = 60;
         for (let i = 0; i <= pts; i++) {
           const theta = (i / pts) * Math.PI * 2;
-          const wave = Math.sin(theta * 4 + time * 3 + layer) * (10 * energy);
+          const wave = Math.sin(theta * 4 + time * 3 + layer) * (11 * energy);
           const cr = r + wave - (layer * 10);
           const x = cx + Math.cos(theta) * cr;
           const y = cy + Math.sin(theta) * cr;
@@ -941,11 +1069,14 @@ LIVE_ORB_HTML = """
         ctx.closePath();
         ctx.stroke();
       }
+      ctx.shadowBlur = 0;
 
+      // Çekirdek (Simli Kristal Mor-Pembe Core)
       const core = ctx.createRadialGradient(cx, cy, 0, cx, cy, r * 0.85);
       core.addColorStop(0, "#ffffff");
-      core.addColorStop(0.4, isRecording ? "#00ffb4" : "#ff007f");
-      core.addColorStop(0.8, "#7b2cbf");
+      core.addColorStop(0.3, isUserTalking ? "#f472b6" : "#ec4899");
+      core.addColorStop(0.65, "#a855f7");
+      core.addColorStop(0.9, "#581c87");
       core.addColorStop(1, "transparent");
       ctx.fillStyle = core;
       ctx.beginPath();
@@ -977,7 +1108,7 @@ async def lifespan(app: FastAPI):
 
     if BOT_TOKEN:
         poll_task = asyncio.create_task(telegram_long_poll_loop())
-        log_event("SYS", f"Katya MediaRecorder Mimarisinde ({FOUNDER_NAME} Anne) baslatildi!")
+        log_event("SYS", f"Katya Hands-Free VAD Mimarisinde ({FOUNDER_NAME} Anne) baslatildi!")
 
     yield
 
@@ -999,7 +1130,7 @@ async def home():
 async def live_app():
     return HTMLResponse(content=LIVE_ORB_HTML)
 
-# YENİ SES AKIŞI ENDPOINT'İ (MediaRecorder -> Whisper -> LLM -> Edge-TTS)
+# SES AKIŞI ENDPOINT'İ (MediaRecorder -> Whisper -> LLM -> Edge-TTS)
 @app.post("/api/voice_stream")
 async def voice_stream_endpoint(audio_file: UploadFile = File(...)):
     audio_data = await audio_file.read()
