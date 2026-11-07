@@ -50,10 +50,10 @@ if MONGO_URI:
     except Exception as e:
         print(f"[ERR] Mongo istemci olusturma hatasi: {e}", flush=True)
 
-# CANLI DİYALOG GEÇMİŞİ (Unutmayı Engelleyen Tampon Bellek)
+# CANLI DİYALOG GEÇMİŞİ
 voice_dialogue_history = []
 scheduled_tasks = {}
-cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+cached_active_models = []
 polling_running = False
 
 def log_event(level: str, message: str):
@@ -246,7 +246,7 @@ async def db_save_custom_skill(name: str, code: str, desc: str):
         pass
 
 # ==========================================
-# YARDIMCI VE MODEL HAZIRLIĞI
+# MODEL LİSTESİ DOĞRULAMA (404 ÖNLEYİCİ)
 # ==========================================
 
 def strip_emojis_and_markdown(text: str) -> str:
@@ -266,20 +266,24 @@ async def refresh_groq_models():
     if not groq_client: return
     try:
         models_data = await groq_client.models.list()
-        valid = [m.id for m in models_data.data]
+        banned = ["whisper", "guard", "embed", "vision", "allam", "orpheus"]
+        # API'den hesabınızda gerçekten var olan modelleri alıyoruz
+        valid = [m.id for m in models_data.data if not any(x in m.id.lower() for x in banned)]
+        
+        # Öncelik sırası: Hesabınızda açık olan en stabil modeller
         preferred = [
+            "openai/gpt-oss-120b",
+            "openai/gpt-oss-20b",
+            "qwen/qwen3.8-27b",
             "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant",
-            "llama3-70b-8192",
-            "llama3-8b-8192",
-            "mixtral-8x7b-32768"
+            "llama-3.1-8b-instant"
         ]
-        sorted_models = [p for p in preferred if p in valid]
-        cached_active_models = sorted_models if sorted_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-        log_event("SYS", f"Guvenilir Groq modelleri sabitlendi: {cached_active_models}")
+        sorted_models = [p for p in preferred if p in valid] + [v for v in valid if v not in preferred]
+        cached_active_models = sorted_models if sorted_models else valid
+        log_event("SYS", f"Hesapta aktif Groq modelleri tespit edildi: {cached_active_models}")
     except Exception as e:
-        log_event("WARN", f"Model listesi alinamadi: {e}")
-        cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        log_event("WARN", f"Model listeleme hatasi: {e}")
+        cached_active_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
 async def tg_api(method: str, data: dict = None):
     if not BOT_TOKEN:
@@ -550,6 +554,7 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                     messages.append(msg)
                     messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(tool_result)})
 
+                # 400 hatasını önlemek için ikinci turda tools kaldırılıyor
                 final_res = await groq_client.chat.completions.create(
                     model=model_name,
                     messages=messages,
@@ -679,7 +684,7 @@ async def handle_telegram_update(upd: dict):
             await tg_api("sendMessage", {"chat_id": chat_id, "text": "Yalnizca kurucum Sabrina ile ozel gorusme yapabilirim."})
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ (KESİNTİSİZ & DÖNGÜSÜZ)
+# CANLI MINI APP ARAYÜZÜ
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -824,7 +829,6 @@ LIVE_ORB_HTML = """
     if (SpeechRecognition) {
       recognition = new SpeechRecognition();
       recognition.lang = "tr-TR";
-      // KESİNTİSİZ TEKİL DÖNGÜ (Döngü spamini önleyen ayar)
       recognition.continuous = false;
       recognition.interimResults = true;
 
@@ -880,7 +884,6 @@ LIVE_ORB_HTML = """
 
       recognition.onend = () => {
         isListening = false;
-        // ASLA OTOMATİK START ÇAĞIRMIYORUZ! İzin spamini tamamen kesen yer burası.
       };
     }
 
@@ -897,8 +900,7 @@ LIVE_ORB_HTML = """
       isSpeaking = false;
       isProcessing = false;
       currentAudio = null;
-      statusText.innerText = "Dinlemek Icin Dokun";
-      // Katya'nın sözü bitince sadece kullanıcı küreye dokunduğunda veya tek bir gecikmeli çağrıyla temiz geçiş
+      statusText.innerText = "Seni Dinliyor";
       setTimeout(() => {
         safeStartListening();
       }, 500);
@@ -1043,5 +1045,4 @@ async def voice_chat_endpoint(payload: ChatPayload):
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)get("PORT", 10000))
     uvicorn.run("main:app", host="0.0.0.0", port=port)
