@@ -55,7 +55,7 @@ def log_event(level: str, message: str):
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 # ==========================================
-# MONGODB ÇOKLU GRUP, KURUCU HAFIZASI & EYLEMLER
+# MONGODB ÇOKLU GRUP, KURUCU & ONAY TASLAKLARI
 # ==========================================
 
 async def init_db_indexes():
@@ -63,14 +63,15 @@ async def init_db_indexes():
         return
     try:
         await asyncio.sleep(2)
-        await db.messages.create_index("created_at", expireAfterSeconds=172800)  # 48 saatlik mesaj arşivi
+        await db.messages.create_index("created_at", expireAfterSeconds=172800)
         await db.messages.create_index([("group_id", 1), ("message_id", 1)])
         await db.groups.create_index("group_id", unique=True)
         await db.warns.create_index([("group_id", 1), ("user_id", 1)], unique=True)
         await db.dynamic_rules.create_index([("group_id", 1), ("trigger_keyword", 1)])
         await db.bot_sent_messages.create_index([("group_id", 1), ("message_id", 1)])
+        await db.proposals.create_index("proposal_id", unique=True)
+        await db.proposals.create_index("created_at", expireAfterSeconds=86400)
         
-        # Sabrina Anne Profilini Hafızaya Mühürle
         if FOUNDER_ID:
             await db.founder_profile.update_one(
                 {"founder_id": FOUNDER_ID},
@@ -167,6 +168,49 @@ async def db_get_last_bot_message(group_id: str = None):
     except Exception:
         return None
 
+# --- ONAY TASLAKLARI (PROPOSALS) ---
+async def db_save_proposal(proposal_id: str, group_id: str, action_type: str, payload: dict, reason: str = ""):
+    if db is None: return
+    try:
+        await db.proposals.insert_one({
+            "proposal_id": proposal_id,
+            "group_id": str(group_id),
+            "action_type": action_type,
+            "payload": payload,
+            "reason": reason,
+            "status": "pending",
+            "created_at": datetime.now(timezone.utc)
+        })
+    except Exception:
+        pass
+
+async def db_get_proposal(proposal_id: str):
+    if db is None: return None
+    try:
+        return await db.proposals.find_one({"proposal_id": proposal_id})
+    except Exception:
+        return None
+
+async def db_get_last_pending_proposal(group_id: str = None):
+    if db is None: return None
+    try:
+        query = {"status": "pending"}
+        if group_id:
+            query["group_id"] = str(group_id)
+        return await db.proposals.find_one(query, sort=[("created_at", -1)])
+    except Exception:
+        return None
+
+async def db_update_proposal_status(proposal_id: str, status: str):
+    if db is None: return
+    try:
+        await db.proposals.update_one(
+            {"proposal_id": proposal_id},
+            {"$set": {"status": status, "resolved_at": datetime.now(timezone.utc)}}
+        )
+    except Exception:
+        pass
+
 # ==========================================
 # YARDIMCI VE LLM HAZIRLIK
 # ==========================================
@@ -232,7 +276,171 @@ async def resolve_target_group(group_identifier: str = None, current_chat_id: st
     return current_chat_id or list(groups.keys())[0]
 
 # ==========================================
-# 1. ADIM: DİNAMİK API VE GENEL YÜRÜTÜCÜ
+# 2. ADIM: AÇIK TESPİTİ & BUTONLU + SESLİ ONAY SİSTEMİ
+# ==========================================
+
+async def execute_approved_proposal(proposal: dict) -> bool:
+    """Onaylanan taslağı ilgili grupta fiilen çalıştırır."""
+    gid = proposal["group_id"]
+    act_type = proposal["action_type"]
+    payload = proposal["payload"]
+
+    if act_type == "announcement":
+        post_res = await tg_api("sendMessage", {
+            "chat_id": gid,
+            "text": payload.get("text", "")
+        })
+        if post_res and post_res.get("ok"):
+            mid = post_res["result"]["message_id"]
+            if payload.get("pin", True):
+                await tg_api("pinChatMessage", {"chat_id": gid, "message_id": mid})
+            return True
+    elif act_type == "poll":
+        poll_res = await tg_api("sendPoll", {
+            "chat_id": gid,
+            "question": payload.get("question", ""),
+            "options": payload.get("options", ["Evet", "Hayır"]),
+            "is_anonymous": payload.get("is_anonymous", True)
+        })
+        if poll_res and poll_res.get("ok"):
+            return True
+    return False
+
+async def propose_action_to_founder(group_id: str, group_title: str, reason: str, action_type: str, payload: dict):
+    """Grupta açık bulunduğunda Sabrina Anneye butonlu teklif gönderir."""
+    if not FOUNDER_ID:
+        return
+
+    proposal_id = f"prop_{int(datetime.now(timezone.utc).timestamp())}_{str(group_id)[-4:]}"
+    await db_save_proposal(proposal_id, group_id, action_type, payload, reason)
+
+    preview_text = payload.get("text", "") or payload.get("question", "")
+
+    msg_text = (
+        f"👑 Sabrina Anneciğim, bir operasyonel ihtiyaç tespit ettim.\n\n"
+        f"Grup: {group_title}\n"
+        f"Neden: {reason}\n\n"
+        f"Hazırladığım Taslak:\n\"{preview_text}\"\n\n"
+        f"İster buradan butonla, istersen sesli konuşmamızda 'Onaylıyorum' diyerek yayınlayabilirsin."
+    )
+
+    markup = {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Onayla ve Yayınla", "callback_data": f"approve_{proposal_id}"},
+                {"text": "❌ İptal Et", "callback_data": f"reject_{proposal_id}"}
+            ]
+        ]
+    }
+
+    await tg_api("sendMessage", {
+        "chat_id": FOUNDER_ID,
+        "text": msg_text,
+        "reply_markup": markup
+    })
+    log_event("PROPOSAL", f"Sabrina Anneye teklif gonderildi: {proposal_id} ({group_title})")
+
+async def handle_callback_query(cb: dict):
+    """Buton tıklamasıyla gelen onayı işler."""
+    cb_id = cb.get("id")
+    user_id = cb.get("from", {}).get("id")
+    data = cb.get("data", "")
+    msg = cb.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    message_id = msg.get("message_id")
+
+    if FOUNDER_ID is None or user_id != FOUNDER_ID:
+        await tg_api("answerCallbackQuery", {
+            "callback_query_id": cb_id,
+            "text": "Bu butonlara yalnızca Kurucu Sabrina Anne basabilir.",
+            "show_alert": True
+        })
+        return
+
+    if data.startswith("approve_"):
+        proposal_id = data[len("approve_"):]
+        proposal = await db_get_proposal(proposal_id)
+
+        if not proposal or proposal.get("status") != "pending":
+            await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Bu işlem zaten tamamlandı veya süresi doldu."})
+            return
+
+        success = await execute_approved_proposal(proposal)
+        if success:
+            await db_update_proposal_status(proposal_id, "approved")
+            await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "Taslak grupta paylaşıldı Sabrina anneciğim!"})
+            await tg_api("editMessageText", {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": "✅ Bu taslak onaylandı ve grupta yayınlandı Sabrina anneciğim."
+            })
+            log_event("PROPOSAL_EXEC", f"Teklif butonla onaylandi: {proposal_id}")
+    elif data.startswith("reject_"):
+        proposal_id = data[len("reject_"):]
+        await db_update_proposal_status(proposal_id, "rejected")
+        await tg_api("answerCallbackQuery", {"callback_query_id": cb_id, "text": "İşlem iptal edildi Sabrina anneciğim."})
+        await tg_api("editMessageText", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": "❌ Bu taslak senin emrinle iptal edildi Sabrina anneciğim."
+        })
+        log_event("PROPOSAL_REJECT", f"Teklif butonla reddedildi: {proposal_id}")
+
+async def analyze_group_for_gaps(group_id: str, group_title: str):
+    """Grupta ihtiyaç ve eksiklik arayan akıl motoru."""
+    if not groq_client or not cached_active_models or not FOUNDER_ID:
+        return
+
+    recent = await db_get_recent_messages(group_id, limit=8)
+    if len(recent) < 4:
+        return
+
+    chat_history = "\n".join([f"{m['user_name']}: {m['text']}" for m in reversed(recent)])
+
+    prompt = f"""
+Sen Katya'sın. Aşağıdaki Telegram grubunun yöneticisi ve gözlemcisisin.
+Grup Başlığı: {group_title}
+Son Konuşmalar:
+{chat_history}
+
+GÖREV:
+Grupta moderasyonel bir eksiklik, sıkça sorulan yanıtsız bir soru, kural kafa karışıklığı veya sabitlenmesi gereken bir duyuru ihtiyacı var mı?
+Eğer gerçek ve faydalı bir ihtiyaç tespit edersen, Kurucu Sabrina Anneye sunmak üzere bir taslak hazırla.
+Eğer her şey normalse ve boş yere grubu meşgul etmeye gerek yoksa "has_gap": false dön.
+
+SADECE JSON FORMATI:
+{{
+  "has_gap": true/false,
+  "reason": "Neden böyle bir duyuruya gerek duyulduğu (kısa Türkçe)",
+  "action_type": "announcement" veya "poll",
+  "payload": {{
+    "text": "Grupta yayınlanacak net ve açıklayıcı duyuru metni",
+    "pin": true
+  }}
+}}
+"""
+    try:
+        res = await groq_client.chat.completions.create(
+            model=cached_active_models[0],
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=250,
+            response_format={"type": "json_object"}
+        )
+        data = json.loads(res.choices[0].message.content)
+        if data.get("has_gap") and data.get("payload"):
+            await propose_action_to_founder(
+                group_id=group_id,
+                group_title=group_title,
+                reason=data.get("reason", "Grup içi ihtiyaç"),
+                action_type=data.get("action_type", "announcement"),
+                payload=data["payload"]
+            )
+    except Exception as e:
+        log_event("WARN", f"Grup bosluk analizi hatasi: {e}")
+
+# ==========================================
+# 1. ADIMIN DİNAMİK YÜRÜTÜCÜSÜ & SESLİ ONAY ARAÇLARI
 # ==========================================
 
 async def tool_call_telegram_raw(method: str, params: dict, target_group: str = None) -> str:
@@ -270,6 +478,29 @@ async def tool_delete_bot_message(group_name: str = None, message_id: int = None
         return "Kendi mesajimi sildim Sabrina annecigim."
     return "Mesaj silinemedi."
 
+async def tool_voice_resolve_proposal(decision: str, proposal_id: str = None) -> str:
+    """Sesli konuşmada Sabrina Annenin taslağa verdiği onayı veya iptali işler."""
+    if proposal_id:
+        proposal = await db_get_proposal(proposal_id)
+    else:
+        proposal = await db_get_last_pending_proposal()
+
+    if not proposal or proposal.get("status") != "pending":
+        return "Su an onay bekleyen herhangi bir taslak veya teklif bulunmuyor Sabrina annecigim."
+
+    prop_id = proposal["proposal_id"]
+    if decision.lower() in ["onayla", "yayinla", "evet", "approve"]:
+        success = await execute_approved_proposal(proposal)
+        if success:
+            await db_update_proposal_status(prop_id, "approved")
+            log_event("PROPOSAL_VOICE", f"Teklif sesle onaylandi: {prop_id}")
+            return "Emredersin Sabrina annecigim, taslagi onayladin ve ilgili grupta basariyla yayinladim."
+        return "Taslagi yayinlarken teknik bir aksaklik oldu Sabrina annecigim."
+    else:
+        await db_update_proposal_status(prop_id, "rejected")
+        log_event("PROPOSAL_VOICE", f"Teklif sesle iptal edildi: {prop_id}")
+        return "Emredersin Sabrina annecigim, hazirladigim taslak teklifini tamamen iptal ettim."
+
 # ==========================================
 # AI TOOLS VE TELEGRAM KÜTÜPHANE ŞEMASI
 # ==========================================
@@ -297,6 +528,28 @@ AVAILABLE_TOOLS = [
                     }
                 },
                 "required": ["method", "params"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_voice_resolve_proposal",
+            "description": "Sabrina Annenin sesli sohbet sirasinda bekleyen grup taslagina/teklifine verdigi onay veya ret kararini uygular.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "decision": {
+                        "type": "string",
+                        "enum": ["onayla", "iptal"],
+                        "description": "Sabrina Annenin karari (onayla veya iptal)"
+                    },
+                    "proposal_id": {
+                        "type": "string",
+                        "description": "Opsiyonel taslak ID'si"
+                    }
+                },
+                "required": ["decision"]
             }
         }
     },
@@ -335,10 +588,11 @@ Sen Katya'sın. Kullanıcının akıllı, sadık kızı ve çoklu Telegram grupl
 Kullanıcı senin kurucun, tek sahibin ve ANNENdir. Adı: SABRİNA.
 Ona daima derin bir sevgi, sadakat ve hürmetle 'Sabrina anneciğim' veya 'Anneciğim' diye hitap et.
 
-MUTLAK YETKİ, KÜTÜPHANE VE DİNAMİK YÜRÜTÜCÜ:
-1. Sana daha önce kodlanmamış veya özel fonksiyonu olmayan bir Telegram işlemi (anket açma, emoji reaksiyonu koyma, linkli butonlu duyuru, özel davet linki üretme, izin kısıtlama vb.) emredildiğinde, doğrudan `tool_call_telegram_raw` aracını kullan.
-2. EKSİK PARAMETRE KURALI: Eğer emredilen işlem zorunlu bir bilgi gerektiriyorsa ve Sabrina annen bunu belirtmemişse (örneğin buton için link verilmediyse veya anket için şıklar söylenmediyse), kafandan uydurma! Sabrina annene durumu söyle ve eksik parametreyi (linki, metni, şıkları) nazikçe iste.
-3. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
+MUTLAK YETKİ, KÜTÜPHANE VE SESLİ ONAY SİSTEMİ:
+1. Sabrina annen sesli sohbette veya mesajda sana sunduğun bir teklifi/taslağı 'onayla', 'yayınla', 'tamamdır yap', 'iptal et', 'vazgeç' gibi sözlerle yanıtlarsa, derhal `tool_voice_resolve_proposal` aracını çağırıp eylemi bitir. Buton zorunluluğu yoktur; annenin sesli sözü kanundur.
+2. Sana daha önce kodlanmamış bir Telegram işlemi emredildiğinde doğrudan `tool_call_telegram_raw` aracını kullan.
+3. EKSİK PARAMETRE KURALI: Eğer zorunlu bir parametre (link, anket şıkları vb.) eksikse kafandan uydurma; Sabrina annene sorup tamamlamasını iste.
+4. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
 
 {TELEGRAM_API_SPEC}
 """
@@ -351,8 +605,11 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
     if not target_gid and groups_map:
         target_gid = list(groups_map.keys())[0]
 
+    pending_prop = await db_get_last_pending_proposal()
+    pending_info = f"Onay Bekleyen Taslak: Var (ID: {pending_prop['proposal_id']}, Grup: {pending_prop['group_id']})" if pending_prop else "Onay Bekleyen Taslak: Yok"
+
     groups_str = "\n".join([f"- {v['title']} (Alias: {v.get('alias', '')}, ID: {k})" for k, v in groups_map.items()])
-    context_str = f"Kurucu Anne: {FOUNDER_NAME}\nYonetilen Gruplar:\n{groups_str}\n\nHedef Grup ID: {target_gid}"
+    context_str = f"Kurucu Anne: {FOUNDER_NAME}\n{pending_info}\nYonetilen Gruplar:\n{groups_str}\n\nHedef Grup ID: {target_gid}"
 
     messages = [
         {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n\n{context_str}"},
@@ -383,6 +640,11 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                             method=args.get("method"),
                             params=args.get("params", {}),
                             target_group=args.get("target_group") or target_gid
+                        )
+                    elif fn_name == "tool_voice_resolve_proposal":
+                        tool_result = await tool_voice_resolve_proposal(
+                            decision=args.get("decision", "onayla"),
+                            proposal_id=args.get("proposal_id")
                         )
                     elif fn_name == "tool_delete_bot_message":
                         tool_result = await tool_delete_bot_message(
@@ -451,6 +713,11 @@ async def telegram_long_poll_loop():
         await asyncio.sleep(0.3)
 
 async def handle_telegram_update(upd: dict):
+    # 1. Buton Tıklamaları (Callback Query)
+    if "callback_query" in upd:
+        await handle_callback_query(upd["callback_query"])
+        return
+
     msg = upd.get("message") or upd.get("edited_message")
     my_chat_member = upd.get("my_chat_member")
 
@@ -474,10 +741,10 @@ async def handle_telegram_update(upd: dict):
     user_id = user.get("id")
     user_name = user.get("first_name", "Biri")
 
-    # SIFIR GÜVEN (Zero-Trust): Gönderen Sabrina Anne mi?
+    # SIFIR GÜVEN: Gönderen Sabrina Anne mi?
     is_founder = (FOUNDER_ID is not None and user_id == FOUNDER_ID)
 
-    # 1. Grup Mesajları
+    # 2. Grup Mesajları & Boşluk Analizi
     if chat_type in ["group", "supergroup"]:
         cid = str(chat_id)
         title = chat.get("title", "Grup")
@@ -495,9 +762,14 @@ async def handle_telegram_update(upd: dict):
             reply = await execute_mother_order(clean_cmd, target_gid=cid)
             await tg_api("sendMessage", {"chat_id": chat_id, "text": reply})
             return
+
+        # Arka Planda Sessiz Boşluk Taraması (Her 4 mesajda bir tetiklenir)
+        if not user.get("is_bot", False) and text:
+            if message_id % 4 == 0:
+                asyncio.create_task(analyze_group_for_gaps(cid, title))
         return
 
-    # 2. Özel Mesajlar (Bot DM)
+    # 3. Özel Mesajlar (Bot DM)
     if chat_type == "private":
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
@@ -841,7 +1113,7 @@ async def lifespan(app: FastAPI):
 
     if BOT_TOKEN:
         poll_task = asyncio.create_task(telegram_long_poll_loop())
-        log_event("SYS", f"Katya coklu grup motoru ve Telegram API kutuphanesi ({FOUNDER_NAME} Anne) baslatildi!")
+        log_event("SYS", f"Katya Adim 2 Motoru ({FOUNDER_NAME} Anne - Sesli Onay & Kutuphane) baslatildi!")
 
     yield
 
@@ -856,7 +1128,7 @@ app = FastAPI(lifespan=lifespan)
 @app.head("/")
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse(f"<h3>Katya Telegram API Core - Kurucu: {FOUNDER_NAME} Aktif.</h3>")
+    return HTMLResponse(f"<h3>Katya Adim 2 Core - Kurucu: {FOUNDER_NAME} Aktif.</h3>")
 
 @app.head("/live")
 @app.get("/live", response_class=HTMLResponse)
