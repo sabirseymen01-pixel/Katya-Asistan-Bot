@@ -267,7 +267,6 @@ async def refresh_groq_models():
     try:
         models_data = await groq_client.models.list()
         valid = [m.id for m in models_data.data]
-        # Kotası en geniş ve Tool Calling'de en kusursuz modelleri zorunlu öncelik yapıyoruz
         preferred = [
             "llama-3.3-70b-versatile",
             "llama-3.1-8b-instant",
@@ -501,7 +500,6 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
     messages = [
         {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n{context_str}"}
     ]
-    # Token tasarrufu için son 4 mesajı tutuyoruz
     for hist in voice_dialogue_history[-4:]:
         messages.append(hist)
     messages.append({"role": "user", "content": order_text})
@@ -552,7 +550,6 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                     messages.append(msg)
                     messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(tool_result)})
 
-                # İKİNCİ TURDA TOOLS PARAMETRESİNİ ÇIKARIYORUZ (400 ve Tool Çakışmasını Önleyen Kritik Düzeltme)
                 final_res = await groq_client.chat.completions.create(
                     model=model_name,
                     messages=messages,
@@ -682,7 +679,7 @@ async def handle_telegram_update(upd: dict):
             await tg_api("sendMessage", {"chat_id": chat_id, "text": "Yalnizca kurucum Sabrina ile ozel gorusme yapabilirim."})
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ
+# CANLI MINI APP ARAYÜZÜ (KESİNTİSİZ MİKROFON KİLİTLİ)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -820,6 +817,7 @@ LIVE_ORB_HTML = """
     let isProcessing = false;
     let currentAudio = null;
     let recognition = null;
+    let mediaStreamLock = null;
     let time = 0;
 
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -853,7 +851,6 @@ LIVE_ORB_HTML = """
           speechBox.innerText = `"${userMessage}"`;
           statusText.innerText = "Islem Yapiliyor...";
           isProcessing = true;
-          try { recognition.stop(); } catch(e) {}
 
           try {
             const res = await fetch("/api/voice_chat", {
@@ -873,31 +870,32 @@ LIVE_ORB_HTML = """
       };
 
       recognition.onerror = (e) => {
-        if (sessionActive && !isSpeaking && !isProcessing && e.error !== "no-speech") {
-          setTimeout(resumeListening, 300);
+        if (e.error === "no-speech") return;
+        if (sessionActive && !isSpeaking && !isProcessing) {
+          setTimeout(() => {
+            try { recognition.start(); } catch(err) {}
+          }, 400);
         }
       };
 
       recognition.onend = () => {
         isListening = false;
-        if (sessionActive && !isSpeaking && !isProcessing) setTimeout(resumeListening, 150);
+        if (sessionActive && !isSpeaking && !isProcessing) {
+          setTimeout(() => {
+            try { recognition.start(); } catch(err) {}
+          }, 200);
+        }
       };
-    }
-
-    function resumeListening() {
-      if (sessionActive && !isSpeaking && !isProcessing) {
-        try {
-          recognition.start();
-          statusText.innerText = "Seni Dinliyor";
-        } catch(e) {}
-      }
     }
 
     function finishSpeaking() {
       isSpeaking = false;
       isProcessing = false;
       currentAudio = null;
-      setTimeout(resumeListening, 350);
+      statusText.innerText = "Seni Dinliyor";
+      if (sessionActive) {
+        try { recognition.start(); } catch(e) {}
+      }
     }
 
     function playNeuralVoice(base64Audio) {
@@ -910,8 +908,6 @@ LIVE_ORB_HTML = """
       isProcessing = false;
       statusText.innerText = "Katya Konusuyor";
 
-      try { recognition.stop(); } catch(e) {}
-
       currentAudio.onended = () => { finishSpeaking(); };
       currentAudio.onerror = () => { finishSpeaking(); };
       currentAudio.play().catch(() => { finishSpeaking(); });
@@ -922,13 +918,28 @@ LIVE_ORB_HTML = """
         alert("Tarayiciniz ses tanimayi desteklemiyor.");
         return;
       }
+
       if (!sessionActive) {
+        // İZNİ İLK DOKUNUŞTA ALIP OTURUMA KİLİTLEME
+        try {
+          if (!mediaStreamLock && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+            mediaStreamLock = await navigator.mediaDevices.getUserMedia({ audio: true });
+          }
+        } catch(err) {
+          console.warn("Mikrofon donanim izni alinamadi:", err);
+        }
+
         sessionActive = true;
         speechBox.innerText = "Canli sohbet basladi, seni dinliyorum Sabrina annecigim...";
-        resumeListening();
+        statusText.innerText = "Seni Dinliyor";
+        try { recognition.start(); } catch(e) {}
       } else {
         sessionActive = false;
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+        if (mediaStreamLock) {
+          mediaStreamLock.getTracks().forEach(track => track.stop());
+          mediaStreamLock = null;
+        }
         isSpeaking = false;
         isProcessing = false;
         try { recognition.stop(); } catch(e) {}
