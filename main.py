@@ -26,7 +26,7 @@ DEFAULT_GROUP_ID = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 KATYA_VOICE = "tr-TR-EmelNeural"
 
-# MongoDB Bağlantısı (Motor / PyMongo Standart TLS Yapılandırması)
+# MongoDB Bağlantısı (Standart TLS)
 mongo_client = None
 db = None
 
@@ -55,7 +55,6 @@ def log_event(level: str, message: str):
 # ==========================================
 
 async def init_db_indexes():
-    """MongoDB TTL İndeksi: Mesajları 48 saat (Telegram silme sınırı) saklar, sonra otomatik temizler."""
     if db is None:
         return
     try:
@@ -208,18 +207,25 @@ async def refresh_groq_models():
         preferred = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
         sorted_models = [p for p in preferred if p in valid] + [v for v in valid if v not in preferred]
         cached_active_models = sorted_models if sorted_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-    except Exception:
+        log_event("SYS", f"Kullanilabilir Groq modelleri yuklendi: {cached_active_models[:2]}")
+    except Exception as e:
+        log_event("WARN", f"Groq modelleri listelenemedi: {e}")
         cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 async def tg_api(method: str, data: dict = None):
-    if not BOT_TOKEN: return None
+    if not BOT_TOKEN:
+        log_event("ERR", f"BOT_TOKEN tanimli degil! ({method})")
+        return None
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
             resp = await client.post(url, json=data or {})
-            return resp.json()
+            res_json = resp.json()
+            if not res_json.get("ok"):
+                log_event("WARN", f"TG API ({method}) Yanit Hatasi: {res_json}")
+            return res_json
     except Exception as e:
-        log_event("ERR", f"TG API ({method}): {e}")
+        log_event("ERR", f"TG API ({method}) Baglanti Hatasi: {e}")
         return None
 
 # ==========================================
@@ -815,10 +821,15 @@ async def telegram_long_poll_loop():
                     if data.get("ok"):
                         for upd in data.get("result", []):
                             offset = upd["update_id"] + 1
+                            log_event("TG", f"Yeni hareket alindi: ID {upd['update_id']}")
                             await handle_telegram_update(upd)
                 elif res.status_code == 409:
+                    log_event("WARN", "Polling cakismasi (409). 3 sn bekleniyor...")
                     await asyncio.sleep(3)
-        except Exception:
+                else:
+                    log_event("WARN", f"getUpdates beklenmeyen durum: {res.status_code}")
+        except Exception as e:
+            log_event("ERR", f"Polling dongu hatasi: {e}")
             await asyncio.sleep(2)
         await asyncio.sleep(0.3)
 
@@ -847,6 +858,8 @@ async def handle_telegram_update(upd: dict):
     user_name = user.get("first_name", "Biri")
     reply_to = msg.get("reply_to_message")
     new_members = msg.get("new_chat_members")
+
+    log_event("TG", f"Gelen Mesaj ({chat_type} - {user_name}): '{text}'")
 
     # Yeni üye karşılama
     if new_members and chat_type in ["group", "supergroup"]:
@@ -885,15 +898,17 @@ async def handle_telegram_update(upd: dict):
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
             markup = {"inline_keyboard": [[{"text": "🎙️ Katya Canlı Asistan", "web_app": {"url": app_url}}]]}
-            await tg_api("sendMessage", {
+            res = await tg_api("sendMessage", {
                 "chat_id": chat_id,
                 "text": "Merhaba annecigim! MongoDB destekli coklu grup ve sinirsiz mesaj takip beynim aktif.",
                 "reply_markup": markup
             })
+            log_event("TG", f"/start yaniti iletildi: {res.get('ok') if res else 'Basarisiz'}")
             return
 
         reply = await execute_mother_order(text)
-        await tg_api("sendMessage", {"chat_id": chat_id, "text": reply})
+        res = await tg_api("sendMessage", {"chat_id": chat_id, "text": reply})
+        log_event("TG", f"Ozel mesaj yanitlandi: {res.get('ok') if res else 'Basarisiz'}")
 
 # ==========================================
 # CANLI MINI APP ARAYÜZÜ
