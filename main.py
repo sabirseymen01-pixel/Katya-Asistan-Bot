@@ -1,5 +1,6 @@
 import os
 import re
+import io
 import json
 import asyncio
 import base64
@@ -7,7 +8,7 @@ import urllib.parse
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 import uvicorn
@@ -34,7 +35,7 @@ FOUNDER_NAME = "Sabrina"
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 KATYA_VOICE = "tr-TR-EmelNeural"
 
-# MongoDB Bağlantısı (Standart TLS / Render Uyumlu)
+# MongoDB Bağlantısı
 mongo_client = None
 db = None
 
@@ -50,7 +51,6 @@ if MONGO_URI:
     except Exception as e:
         print(f"[ERR] Mongo istemci olusturma hatasi: {e}", flush=True)
 
-# CANLI DİYALOG GEÇMİŞİ
 voice_dialogue_history = []
 scheduled_tasks = {}
 cached_active_models = []
@@ -138,36 +138,6 @@ async def db_record_message(group_id: str, message_id: int, user_id: int, user_n
     except Exception:
         pass
 
-async def db_get_recent_messages(group_id: str, limit: int = 50, user_id: int = None, text_contains: str = None):
-    if db is None: return []
-    try:
-        query = {"group_id": str(group_id)}
-        if user_id:
-            query["user_id"] = user_id
-        if text_contains:
-            query["text"] = {"$regex": re.escape(text_contains), "$options": "i"}
-
-        cursor = db.messages.find(query).sort("message_id", -1).limit(limit)
-        messages = []
-        async for doc in cursor:
-            messages.append(doc)
-        return messages
-    except Exception:
-        return []
-
-async def db_record_bot_message(group_id: str, message_id: int, text: str = "", msg_type: str = "text"):
-    if db is None: return
-    try:
-        await db.bot_sent_messages.insert_one({
-            "group_id": str(group_id),
-            "message_id": message_id,
-            "text": text,
-            "type": msg_type,
-            "timestamp": datetime.now(timezone.utc)
-        })
-    except Exception:
-        pass
-
 async def db_set_pending_input(action_type: str, missing_param: str, context_data: dict):
     if db is None: return
     try:
@@ -246,7 +216,7 @@ async def db_save_custom_skill(name: str, code: str, desc: str):
         pass
 
 # ==========================================
-# MODEL LİSTESİ DOĞRULAMA (404 ÖNLEYİCİ)
+# YARDIMCI VE MODEL HAZIRLIĞI
 # ==========================================
 
 def strip_emojis_and_markdown(text: str) -> str:
@@ -267,10 +237,8 @@ async def refresh_groq_models():
     try:
         models_data = await groq_client.models.list()
         banned = ["whisper", "guard", "embed", "vision", "allam", "orpheus"]
-        # API'den hesabınızda gerçekten var olan modelleri alıyoruz
         valid = [m.id for m in models_data.data if not any(x in m.id.lower() for x in banned)]
         
-        # Öncelik sırası: Hesabınızda açık olan en stabil modeller
         preferred = [
             "openai/gpt-oss-120b",
             "openai/gpt-oss-20b",
@@ -280,14 +248,13 @@ async def refresh_groq_models():
         ]
         sorted_models = [p for p in preferred if p in valid] + [v for v in valid if v not in preferred]
         cached_active_models = sorted_models if sorted_models else valid
-        log_event("SYS", f"Hesapta aktif Groq modelleri tespit edildi: {cached_active_models}")
+        log_event("SYS", f"Groq Modelleri Hazirlandi: {cached_active_models[:3]}")
     except Exception as e:
-        log_event("WARN", f"Model listeleme hatasi: {e}")
+        log_event("WARN", f"Model listesi alinamadi: {e}")
         cached_active_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
 
 async def tg_api(method: str, data: dict = None):
     if not BOT_TOKEN:
-        log_event("ERR", f"BOT_TOKEN tanimli degil! ({method})")
         return None
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
     try:
@@ -295,10 +262,10 @@ async def tg_api(method: str, data: dict = None):
             resp = await client.post(url, json=data or {})
             res_json = resp.json()
             if not res_json.get("ok"):
-                log_event("WARN", f"TG API ({method}) Yanit Hatasi: {res_json.get('description')}")
+                log_event("WARN", f"TG API ({method}) Hatasi: {res_json.get('description')}")
             return res_json
     except Exception as e:
-        log_event("ERR", f"TG API ({method}) Baglanti Hatasi: {e}")
+        log_event("ERR", f"TG API Baglanti Hatasi: {e}")
         return None
 
 async def resolve_target_group(group_identifier: str = None, current_chat_id: str = None) -> str:
@@ -554,7 +521,6 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                     messages.append(msg)
                     messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(tool_result)})
 
-                # 400 hatasını önlemek için ikinci turda tools kaldırılıyor
                 final_res = await groq_client.chat.completions.create(
                     model=model_name,
                     messages=messages,
@@ -562,14 +528,12 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                     max_tokens=200
                 )
                 final_answer = strip_emojis_and_markdown(final_res.choices[0].message.content.strip())
-                
                 voice_dialogue_history.append({"role": "user", "content": order_text})
                 voice_dialogue_history.append({"role": "assistant", "content": final_answer})
                 return final_answer
 
             raw_text = msg.content.strip() if msg.content else "Seni dinliyorum Sabrina annecigim."
             final_answer = strip_emojis_and_markdown(raw_text)
-            
             voice_dialogue_history.append({"role": "user", "content": order_text})
             voice_dialogue_history.append({"role": "assistant", "content": final_answer})
             return final_answer
@@ -578,6 +542,21 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
             continue
 
     return "Buradayim Sabrina annecigim, seni dinliyorum."
+
+async def transcribe_audio_with_groq(audio_bytes: bytes) -> str:
+    if not groq_client: return ""
+    try:
+        audio_file = io.BytesIO(audio_bytes)
+        audio_file.name = "recording.webm"
+        transcription = await groq_client.audio.transcriptions.create(
+            file=audio_file,
+            model="whisper-large-v3",
+            language="tr"
+        )
+        return transcription.text.strip()
+    except Exception as e:
+        log_event("ERR", f"Groq Whisper Ceviri Hatasi: {e}")
+        return ""
 
 async def text_to_speech_base64(text: str) -> str:
     clean_text = strip_emojis_and_markdown(text)
@@ -669,7 +648,7 @@ async def handle_telegram_update(upd: dict):
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
             markup = {"inline_keyboard": [[{"text": "🎙️ Katya Canlı Asistan", "web_app": {"url": app_url}}]]}
-            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Canli bellegim ve tum sistemler devrede." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
+            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Canli ses akisim ve bellegim devrede." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
             await tg_api("sendMessage", {"chat_id": chat_id, "text": greeting, "reply_markup": markup})
             return
 
@@ -684,7 +663,7 @@ async def handle_telegram_update(upd: dict):
             await tg_api("sendMessage", {"chat_id": chat_id, "text": "Yalnizca kurucum Sabrina ile ozel gorusme yapabilirim."})
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ
+# CANLI MINI APP ARAYÜZÜ (MEDIARECORDER - KESİNTİSİZ TEK İZİN)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -782,14 +761,14 @@ LIVE_ORB_HTML = """
     </div>
     <div class="status-badge">
       <div class="status-dot"></div>
-      <span id="statusText">Baslatmak Icin Dokun</span>
+      <span id="statusText">Konusmak Icin Basili Tut</span>
     </div>
   </div>
 
   <div class="canvas-container">
     <canvas id="orbCanvas"></canvas>
     <div class="hud-overlay">
-      <div class="speech-box" id="speechBox">Sohbeti baslatmak icin dokun Sabrina annecigim...</div>
+      <div class="speech-box" id="speechBox">Kureye basili tut ve konus Sabrina annecigim...</div>
     </div>
   </div>
 
@@ -816,94 +795,99 @@ LIVE_ORB_HTML = """
     window.addEventListener("resize", resize);
     resize();
 
-    let sessionActive = false;
-    let isListening = false;
+    let mediaStream = null;
+    let mediaRecorder = null;
+    let audioChunks = [];
+    let isRecording = false;
     let isSpeaking = false;
-    let isProcessing = false;
     let currentAudio = null;
-    let recognition = null;
     let time = 0;
 
-    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-
-    if (SpeechRecognition) {
-      recognition = new SpeechRecognition();
-      recognition.lang = "tr-TR";
-      recognition.continuous = false;
-      recognition.interimResults = true;
-
-      recognition.onstart = () => {
-        isListening = true;
-        if (!isSpeaking && !isProcessing) statusText.innerText = "Seni Dinliyor";
-      };
-
-      recognition.onresult = async (event) => {
-        if (isSpeaking || isProcessing) return;
-
-        let interim = "";
-        let finalTranscript = "";
-
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) finalTranscript += event.results[i][0].transcript;
-          else interim += event.results[i][0].transcript;
-        }
-
-        if (interim && !isSpeaking) speechBox.innerText = `"${interim}"`;
-
-        if (finalTranscript.trim() && !isProcessing && !isSpeaking) {
-          const userMessage = finalTranscript.trim();
-          speechBox.innerText = `"${userMessage}"`;
-          statusText.innerText = "Islem Yapiliyor...";
-          isProcessing = true;
-
-          try {
-            const res = await fetch("/api/voice_chat", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ message: userMessage })
-            });
-            const data = await res.json();
-            speechBox.innerText = data.reply;
-            if (data.audio) playNeuralVoice(data.audio);
-            else finishSpeaking();
-          } catch (e) {
-            speechBox.innerText = "Baglantida sorun oldu Sabrina annecigim.";
-            finishSpeaking();
-          }
-        }
-      };
-
-      recognition.onerror = (e) => {
-        isListening = false;
-        if (e.error === "not-allowed") {
+    // Mikrofon akışını ilk seferde alıp arka planda açık tutuyoruz (Kalıcı Kilit)
+    async function ensureMicAccess() {
+      if (!mediaStream) {
+        try {
+          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch(err) {
           statusText.innerText = "Mikrofon Izni Verilmedi";
-          speechBox.innerText = "Lutfen mikrofon iznini onaylayin.";
-          sessionActive = false;
+          speechBox.innerText = "Lutfen mikrofon erisimine izin verin.";
+          return false;
         }
-      };
-
-      recognition.onend = () => {
-        isListening = false;
-      };
+      }
+      return true;
     }
 
-    function safeStartListening() {
-      if (sessionActive && !isSpeaking && !isProcessing && !isListening && recognition) {
+    async function startRecording() {
+      if (isSpeaking) return;
+      const ok = await ensureMicAccess();
+      if (!ok) return;
+
+      audioChunks = [];
+      try {
+        mediaRecorder = new MediaRecorder(mediaStream, { mimeType: 'audio/webm' });
+      } catch(e) {
+        mediaRecorder = new MediaRecorder(mediaStream);
+      }
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) audioChunks.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        isRecording = false;
+        statusText.innerText = "Islem Yapiliyor...";
+        speechBox.innerText = "Katya dinledi, cevap hazirlaniyor...";
+
+        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+        if (audioBlob.size < 1000) {
+          statusText.innerText = "Konusmak Icin Dokun";
+          speechBox.innerText = "Cok kisa oldu, tekrar dene Sabrina annecigim.";
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append("audio_file", audioBlob, "speech.webm");
+
         try {
-          recognition.start();
-          statusText.innerText = "Seni Dinliyor";
-        } catch(e) {}
+          const res = await fetch("/api/voice_stream", {
+            method: "POST",
+            body: formData
+          });
+          const data = await res.json();
+          speechBox.innerText = data.reply;
+          if (data.audio) playNeuralVoice(data.audio);
+          else finishSpeaking();
+        } catch(err) {
+          speechBox.innerText = "Baglantida sorun oldu Sabrina annecigim.";
+          finishSpeaking();
+        }
+      };
+
+      mediaRecorder.start();
+      isRecording = true;
+      statusText.innerText = "Seni Dinliyor";
+      speechBox.innerText = "Dinliyorum Sabrina annecigim, konusman bitince tekrar dokun...";
+    }
+
+    function stopRecording() {
+      if (mediaRecorder && isRecording) {
+        mediaRecorder.stop();
+      }
+    }
+
+    function toggleRecording() {
+      if (isSpeaking) return;
+      if (!isRecording) {
+        startRecording();
+      } else {
+        stopRecording();
       }
     }
 
     function finishSpeaking() {
       isSpeaking = false;
-      isProcessing = false;
       currentAudio = null;
-      statusText.innerText = "Seni Dinliyor";
-      setTimeout(() => {
-        safeStartListening();
-      }, 500);
+      statusText.innerText = "Konusmak Icin Dokun";
     }
 
     function playNeuralVoice(base64Audio) {
@@ -913,7 +897,6 @@ LIVE_ORB_HTML = """
       }
       currentAudio = new Audio("data:audio/mp3;base64," + base64Audio);
       isSpeaking = true;
-      isProcessing = false;
       statusText.innerText = "Katya Konusuyor";
 
       currentAudio.onended = () => { finishSpeaking(); };
@@ -921,34 +904,13 @@ LIVE_ORB_HTML = """
       currentAudio.play().catch(() => { finishSpeaking(); });
     }
 
-    async function toggleSession() {
-      if (!recognition) {
-        alert("Tarayiciniz ses tanimayi desteklemiyor.");
-        return;
-      }
-
-      if (!sessionActive) {
-        sessionActive = true;
-        speechBox.innerText = "Canli sohbet basladi, seni dinliyorum Sabrina annecigim...";
-        safeStartListening();
-      } else {
-        sessionActive = false;
-        if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-        isSpeaking = false;
-        isProcessing = false;
-        try { recognition.abort(); } catch(e) {}
-        statusText.innerText = "Durduruldu";
-        speechBox.innerText = "Sohbet durduruldu. Baslatmak icin dokun.";
-      }
-    }
-
-    canvas.addEventListener("click", toggleSession);
+    canvas.addEventListener("click", toggleRecording);
 
     function draw() {
       ctx.clearRect(0, 0, width, height);
       time += 0.03;
       let energy = 0.2;
-      if (isListening && !isSpeaking) energy = 0.55 + Math.sin(time * 5) * 0.2;
+      if (isRecording) energy = 0.65 + Math.sin(time * 6) * 0.25;
       if (isSpeaking) energy = 0.95 + Math.sin(time * 8) * 0.35;
 
       const cx = width / 2;
@@ -956,7 +918,7 @@ LIVE_ORB_HTML = """
       const r = 90 * (1 + energy * 0.35);
 
       const glow = ctx.createRadialGradient(cx, cy, r * 0.3, cx, cy, r * 2.2);
-      glow.addColorStop(0, isSpeaking ? "rgba(255, 0, 127, 0.6)" : "rgba(157, 0, 255, 0.4)");
+      glow.addColorStop(0, isSpeaking ? "rgba(255, 0, 127, 0.6)" : (isRecording ? "rgba(0, 255, 180, 0.5)" : "rgba(157, 0, 255, 0.4)"));
       glow.addColorStop(1, "rgba(6, 4, 10, 0)");
       ctx.fillStyle = glow;
       ctx.beginPath();
@@ -982,7 +944,7 @@ LIVE_ORB_HTML = """
 
       const core = ctx.createRadialGradient(cx, cy, 0, cx, cy, r * 0.85);
       core.addColorStop(0, "#ffffff");
-      core.addColorStop(0.4, "#ff007f");
+      core.addColorStop(0.4, isRecording ? "#00ffb4" : "#ff007f");
       core.addColorStop(0.8, "#7b2cbf");
       core.addColorStop(1, "transparent");
       ctx.fillStyle = core;
@@ -1015,7 +977,7 @@ async def lifespan(app: FastAPI):
 
     if BOT_TOKEN:
         poll_task = asyncio.create_task(telegram_long_poll_loop())
-        log_event("SYS", f"Katya Adim 4 Tam Otonom Cekirdek ({FOUNDER_NAME} Anne) baslatildi!")
+        log_event("SYS", f"Katya MediaRecorder Mimarisinde ({FOUNDER_NAME} Anne) baslatildi!")
 
     yield
 
@@ -1030,12 +992,25 @@ app = FastAPI(lifespan=lifespan)
 @app.head("/")
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse(f"<h3>Katya Adim 4 Core - Kurucu: {FOUNDER_NAME} Aktif.</h3>")
+    return HTMLResponse(f"<h3>Katya Core - Kurucu: {FOUNDER_NAME} Aktif.</h3>")
 
 @app.head("/live")
 @app.get("/live", response_class=HTMLResponse)
 async def live_app():
     return HTMLResponse(content=LIVE_ORB_HTML)
+
+# YENİ SES AKIŞI ENDPOINT'İ (MediaRecorder -> Whisper -> LLM -> Edge-TTS)
+@app.post("/api/voice_stream")
+async def voice_stream_endpoint(audio_file: UploadFile = File(...)):
+    audio_data = await audio_file.read()
+    user_transcript = await transcribe_audio_with_groq(audio_data)
+    
+    if not user_transcript:
+        user_transcript = "Ses anlasilamadi."
+
+    reply = await execute_mother_order(user_transcript)
+    audio_base64 = await text_to_speech_base64(reply)
+    return JSONResponse({"reply": reply, "audio": audio_base64, "transcript": user_transcript})
 
 @app.post("/api/voice_chat")
 async def voice_chat_endpoint(payload: ChatPayload):
