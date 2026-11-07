@@ -1,5 +1,6 @@
 import os
 import re
+import ssl
 import json
 import asyncio
 import base64
@@ -26,18 +27,22 @@ DEFAULT_GROUP_ID = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 KATYA_VOICE = "tr-TR-EmelNeural"
 
-# MongoDB Bağlantısı (Sağlamlaştırılmış SSL / TLS Desteği)
+# MongoDB Bağlantısı (SSL Handshake Uyumlu Güvenli Yapılandırma)
 mongo_client = None
 db = None
+
 if MONGO_URI:
     try:
+        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
         mongo_client = AsyncIOMotorClient(
             MONGO_URI,
             tls=True,
-            tlsCAFile=certifi.where(),
-            tlsAllowInvalidCertificates=True,
-            serverSelectionTimeoutMS=5000,
-            connectTimeoutMS=5000
+            ssl_context=ssl_ctx,
+            serverSelectionTimeoutMS=4000,
+            connectTimeoutMS=4000
         )
         db = mongo_client["katya_db"]
     except Exception as e:
@@ -60,14 +65,14 @@ async def init_db_indexes():
     if db is None:
         return
     try:
-        await asyncio.sleep(2)  # Sunucu portunun acilmasina oncelik ver
+        await asyncio.sleep(2)
         await db.messages.create_index("created_at", expireAfterSeconds=172800)
         await db.messages.create_index([("group_id", 1), ("message_id", 1)])
         await db.groups.create_index("group_id", unique=True)
         await db.warns.create_index([("group_id", 1), ("user_id", 1)], unique=True)
         log_event("SYS", "MongoDB indeksleri ve 48 saatlik mesaj deposu hazirlandi.")
     except Exception as e:
-        log_event("WARN", f"MongoDB indeks uyarisi (islem devam ediyor): {e}")
+        log_event("WARN", f"MongoDB arka plan bildirimi: {e}")
 
 async def db_save_group(group_id: str, title: str):
     if db is None: return
@@ -228,7 +233,6 @@ async def tg_api(method: str, data: dict = None):
 # ==========================================
 
 async def tool_delete_messages(group_id: str, count: int = 1, user_id: int = None, text_contains: str = None) -> str:
-    """MongoDB'deki 48 saatlik depodan mesajları filtreleyip Telegram'dan siler."""
     docs = await db_get_recent_messages(group_id, limit=count, user_id=user_id, text_contains=text_contains)
     deleted = 0
     for d in docs:
@@ -400,7 +404,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_delete_messages",
-            "description": "Grupta son N mesaji, belirli bir kullanicinin mesajlarini veya icerik tarifine gore mesajlari siler.",
+            "description": "Grupta son N mesaji veya belirli bir kullanicinin mesajlarini siler.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -850,7 +854,7 @@ async def handle_telegram_update(upd: dict):
     reply_to = msg.get("reply_to_message")
     new_members = msg.get("new_chat_members")
 
-    # Yeni üye katıldığında otomatik karşılama
+    # Yeni üye karşılama
     if new_members and chat_type in ["group", "supergroup"]:
         cfg = await db_get_group_config(str(chat_id))
         w_msg = cfg.get("welcome_msg", "Grubumuza hos geldiniz!")
@@ -862,13 +866,11 @@ async def handle_telegram_update(upd: dict):
         await tg_api("sendMessage", payload)
         return
 
-    # 1. Gruptan gelen mesajlar
+    # Gruptan gelen mesajlar
     if chat_type in ["group", "supergroup"]:
         cid = str(chat_id)
         title = chat.get("title", "Grup")
         await db_save_group(cid, title)
-
-        # Mesajı 48 saatlik MongoDB deposuna yaz
         await db_record_message(cid, message_id, user_id, user_name, text)
 
         if text.startswith("/bagla") or text.startswith("/katya"):
@@ -880,12 +882,11 @@ async def handle_telegram_update(upd: dict):
         if handled:
             return
 
-        # Canlı Kural Analizi
         if text and not user.get("is_bot", False):
             asyncio.create_task(analyze_and_moderate_message(chat_id, message_id, user_id, user_name, text))
         return
 
-    # 2. Özel mesajlar (Bot Chat)
+    # Özel mesajlar (Bot Chat)
     if chat_type == "private":
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
@@ -901,7 +902,7 @@ async def handle_telegram_update(upd: dict):
         await tg_api("sendMessage", {"chat_id": chat_id, "text": reply})
 
 # ==========================================
-# CANLI MINI APP ARAYÜZÜ (SIFIR EKO)
+# CANLI MINI APP ARAYÜZÜ
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -1072,7 +1073,6 @@ LIVE_ORB_HTML = """
           speechBox.innerText = `"${userMessage}"`;
           statusText.innerText = "Islem Yapiliyor...";
           isProcessing = true;
-          
           try { recognition.stop(); } catch(e) {}
 
           try {
@@ -1223,14 +1223,11 @@ db_index_task = None
 async def lifespan(app: FastAPI):
     global poll_task, db_index_task
     
-    # 1. Groq modellerini onbellege al
     await refresh_groq_models()
 
-    # 2. MongoDB indekslemesini arka planda baslat (Portun hemen acilmasini saglar, Render kapanmaz)
     if db is not None:
         db_index_task = asyncio.create_task(init_db_indexes())
 
-    # 3. Telegram Polling'i aninda baslat
     if BOT_TOKEN:
         poll_task = asyncio.create_task(telegram_long_poll_loop())
         log_event("SYS", "Katya coklu grup motoru ve Telegram dinleyicisi baslatildi!")
