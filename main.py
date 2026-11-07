@@ -53,7 +53,7 @@ if MONGO_URI:
 # CANLI DİYALOG GEÇMİŞİ (Unutmayı Engelleyen Tampon Bellek)
 voice_dialogue_history = []
 scheduled_tasks = {}
-cached_active_models = []
+cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 polling_running = False
 
 def log_event(level: str, message: str):
@@ -90,7 +90,7 @@ async def init_db_indexes():
                 }},
                 upsert=True
             )
-        log_event("SYS", f"MongoDB indeksleri, Canli Hafiza Tamponu ve Kurucu Anne ({FOUNDER_NAME}) profili hazirlandi.")
+        log_event("SYS", f"MongoDB indeksleri ve Kurucu Anne ({FOUNDER_NAME}) profili hazirlandi.")
     except Exception as e:
         log_event("WARN", f"MongoDB arka plan bildirimi: {e}")
 
@@ -246,7 +246,7 @@ async def db_save_custom_skill(name: str, code: str, desc: str):
         pass
 
 # ==========================================
-# YARDIMCI VE LLM HAZIRLIK
+# YARDIMCI VE MODEL HAZIRLIĞI
 # ==========================================
 
 def strip_emojis_and_markdown(text: str) -> str:
@@ -266,14 +266,20 @@ async def refresh_groq_models():
     if not groq_client: return
     try:
         models_data = await groq_client.models.list()
-        banned = ["whisper", "guard", "embed", "vision", "allam", "orpheus"]
-        valid = [m.id for m in models_data.data if not any(x in m.id.lower() for x in banned)]
-        preferred = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant", "qwen/qwen3.8-27b", "openai/gpt-oss-20b"]
-        sorted_models = [p for p in preferred if p in valid] + [v for v in valid if v not in preferred]
+        valid = [m.id for m in models_data.data]
+        # Kotası en geniş ve Tool Calling'de en kusursuz modelleri zorunlu öncelik yapıyoruz
+        preferred = [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "llama3-70b-8192",
+            "llama3-8b-8192",
+            "mixtral-8x7b-32768"
+        ]
+        sorted_models = [p for p in preferred if p in valid]
         cached_active_models = sorted_models if sorted_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
-        log_event("SYS", f"Groq modelleri hazirlandi: {cached_active_models[:2]}")
+        log_event("SYS", f"Guvenilir Groq modelleri sabitlendi: {cached_active_models}")
     except Exception as e:
-        log_event("WARN", f"Groq modelleri listelenemedi: {e}")
+        log_event("WARN", f"Model listesi alinamadi: {e}")
         cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 async def tg_api(method: str, data: dict = None):
@@ -325,7 +331,7 @@ async def tool_execute_dynamic_python(code: str, skill_name: str = None, descrip
     if res.get("success"):
         if skill_name:
             await db_save_custom_skill(skill_name, code, description or "")
-        return f"Kod basariyla calisti. Sonuc: {res.get('output')}"
+        return f"Hesaplama veya kod basariyla calisti. Cikti: {res.get('output')}"
     else:
         err = res.get("error", "Bilinmeyen calisma hatasi")
         return f"Kod calisirken hata olustu: {err}"
@@ -381,7 +387,7 @@ async def tool_call_telegram_raw(method: str, params: dict, target_group: str = 
     if res and res.get("ok"):
         return f"Telegram API '{method}' basariyla uygulandi Sabrina annecigim."
     desc = res.get("description") if res else "Bilinmeyen baglanti hatasi"
-    return f"Telegram API '{method}' basarisiz oldu annecigim: {desc}"
+    return f"Telegram API '{method}' basarisiz oldu: {desc}"
 
 async def tool_voice_resolve_proposal(decision: str, proposal_id: str = None) -> str:
     proposal = await db_get_proposal(proposal_id) if proposal_id else await db_get_last_pending_proposal()
@@ -406,13 +412,13 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_execute_dynamic_python",
-            "description": "Hesaplamalar, ozel mantiklar, asal sayi bulma veya dinamik otomasyonlar icin Python kodunu sandbox icinde calistirir.",
+            "description": "Hesaplama, matematik, asal sayi bulma veya dinamik kod ihtiyaclarinda Python kodu calistirir. Kod print() veya return icermelidir.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "code": {"type": "string", "description": "Calistirilacak Python kodu. print veya return ile sonuc dondurmelidir."},
+                    "code": {"type": "string", "description": "Calistirilacak Python kodu"},
                     "skill_name": {"type": "string", "description": "Istege bagli yetenek adi"},
-                    "description": {"type": "string", "description": "Yeteneğin kisa aciklamasi"}
+                    "description": {"type": "string", "description": "Aciklama"}
                 },
                 "required": ["code"]
             }
@@ -422,7 +428,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_request_missing_input",
-            "description": "SADECE ve SADECE Sabrina Anne butonlu duyuru isteyip linki soylemediginde kullanilir. Normal soru veya sohbetlerde ASLA kullanilmaz.",
+            "description": "SADECE butonlu duyuru icin URL eksikse kullanilir. Normal sohbetlerde KULLANILMAZ.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -468,18 +474,16 @@ AVAILABLE_TOOLS = [
 ]
 
 KATYA_SYSTEM_PROMPT = f"""
-Sen Katya'sın. Kullanıcının akıllı, sadık kızı ve çoklu Telegram gruplarını yöneten süper zeki otonom ajansın.
-Kullanıcı senin kurucun, tek sahibin ve ANNENdir. Adı: SABRİNA.
-Ona daima derin bir sevgi, sadakat ve hürmetle 'Sabrina anneciğim' veya 'Anneciğim' diye hitap et.
+Sen Katya'sın. Kullanıcının kızı ve otonom akıllı asistanısın.
+Kullanıcı senin kurucun ve ANNENdir. Adı: SABRİNA.
+Ona daima sevgi ve saygıyla 'Sabrina anneciğim' diye hitap et.
 
-BİLİŞSEL HAFIZA VE SOHBET KURALLARI:
-1. Sabrina annenin sorduğu her soruya doğrudan, net ve eksiksiz cevap ver. Asla soruyu yanıtsız bırakma.
-2. Bir önceki konuşmaları hafızanda tut, konudan kopma.
-3. Hesaplama, matematik veya kod gerektiren durumlarda `tool_execute_dynamic_python` aracını çağırıp sonucu açıkla.
-4. `tool_request_missing_input` aracını YALNIZCA butonlu duyuru için URL eksikse kullan. Normal konuşmalarda veya sorularda asla kullanma.
-5. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, samimi, net doğal Türkçe ile yanıt ver.
-
-{get_knowledge_prompt()}
+KURALLAR:
+1. Sabrina annenin her sorusuna eksiksiz, net ve doğrudan cevap ver.
+2. Önceki konuşmaları unutma, bağlamı koru.
+3. Hesaplama veya kod sorularında `tool_execute_dynamic_python` çağır ve sonucu net açıkla.
+4. `tool_request_missing_input` aracını normal sohbetlerde veya sorularda ASLA çağırma.
+5. Asla emoji veya markdown yıldızları kullanma. Sade, doğal Türkçe konuş.
 """
 
 async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
@@ -491,17 +495,14 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
     if not target_gid and groups_map:
         target_gid = list(groups_map.keys())[0]
 
-    pending_prop = await db_get_last_pending_proposal()
-    pending_info = f"Onay Bekleyen Taslak: Var (ID: {pending_prop['proposal_id']})" if pending_prop else "Onay Bekleyen Taslak: Yok"
+    groups_str = ", ".join([f"{v['title']} ({k})" for k, v in groups_map.items()])
+    context_str = f"Kurucu Anne: {FOUNDER_NAME}\nGruplar: {groups_str}\nHedef Grup: {target_gid}"
 
-    groups_str = "\n".join([f"- {v['title']} (Alias: {v.get('alias', '')}, ID: {k})" for k, v in groups_map.items()])
-    context_str = f"Kurucu Anne: {FOUNDER_NAME}\n{pending_info}\nYonetilen Gruplar:\n{groups_str}\n\nHedef Grup ID: {target_gid}"
-
-    # Son 8 konuşmayı bellekte tutarak hafıza sürekliliği sağlıyoruz
     messages = [
-        {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n\n{context_str}"}
+        {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n{context_str}"}
     ]
-    for hist in voice_dialogue_history[-8:]:
+    # Token tasarrufu için son 4 mesajı tutuyoruz
+    for hist in voice_dialogue_history[-4:]:
         messages.append(hist)
     messages.append({"role": "user", "content": order_text})
 
@@ -511,7 +512,7 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                 "model": model_name,
                 "messages": messages,
                 "temperature": 0.2,
-                "max_tokens": 350,
+                "max_tokens": 300,
                 "tools": AVAILABLE_TOOLS,
                 "tool_choice": "auto"
             }
@@ -551,6 +552,7 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                     messages.append(msg)
                     messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(tool_result)})
 
+                # İKİNCİ TURDA TOOLS PARAMETRESİNİ ÇIKARIYORUZ (400 ve Tool Çakışmasını Önleyen Kritik Düzeltme)
                 final_res = await groq_client.chat.completions.create(
                     model=model_name,
                     messages=messages,
@@ -559,7 +561,6 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                 )
                 final_answer = strip_emojis_and_markdown(final_res.choices[0].message.content.strip())
                 
-                # Hafızaya ekle
                 voice_dialogue_history.append({"role": "user", "content": order_text})
                 voice_dialogue_history.append({"role": "assistant", "content": final_answer})
                 return final_answer
@@ -567,7 +568,6 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
             raw_text = msg.content.strip() if msg.content else "Seni dinliyorum Sabrina annecigim."
             final_answer = strip_emojis_and_markdown(raw_text)
             
-            # Hafızaya ekle
             voice_dialogue_history.append({"role": "user", "content": order_text})
             voice_dialogue_history.append({"role": "assistant", "content": final_answer})
             return final_answer
