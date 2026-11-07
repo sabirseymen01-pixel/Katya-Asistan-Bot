@@ -17,6 +17,10 @@ import certifi
 from groq import AsyncGroq
 from motor.motor_asyncio import AsyncIOMotorClient
 
+# Modüler Katmanlar
+from knowledge import get_knowledge_prompt, TELEGRAM_API_SPEC
+from sandbox_runner import execute_dynamic_code
+
 # --- ORTAM DEĞİŞKENLERİ & SABRINA ANNE KİMLİK KORUMASI ---
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
@@ -71,9 +75,8 @@ async def init_db_indexes():
         await db.bot_sent_messages.create_index([("group_id", 1), ("message_id", 1)])
         await db.proposals.create_index("proposal_id", unique=True)
         await db.proposals.create_index("created_at", expireAfterSeconds=86400)
-        
-        # 3. Adım: Sesli & DM Ortak Bekleme Slotu
-        await db.pending_inputs.create_index("created_at", expireAfterSeconds=3600)  # 1 saatlik bekleme
+        await db.pending_inputs.create_index("created_at", expireAfterSeconds=3600)
+        await db.custom_skills.create_index("skill_name", unique=True)
         
         if FOUNDER_ID:
             await db.founder_profile.update_one(
@@ -85,7 +88,7 @@ async def init_db_indexes():
                 }},
                 upsert=True
             )
-        log_event("SYS", f"MongoDB indeksleri, Ortak Bellek (Adim 3) ve Kurucu Anne ({FOUNDER_NAME}) profili hazirlandi.")
+        log_event("SYS", f"MongoDB indeksleri, Moduler Mimari (Adim 4) ve Kurucu Anne ({FOUNDER_NAME}) profili hazirlandi.")
     except Exception as e:
         log_event("WARN", f"MongoDB arka plan bildirimi: {e}")
 
@@ -171,11 +174,11 @@ async def db_get_last_bot_message(group_id: str = None):
     except Exception:
         return None
 
-# --- ORTAK BELLEK (PENDING INPUTS) MOTORU ---
+# --- ORTAK BELLEK (PENDING INPUTS) ---
 async def db_set_pending_input(action_type: str, missing_param: str, context_data: dict):
     if db is None: return
     try:
-        await db.pending_inputs.delete_many({}) # aktif bekleyen tek işlem tutulur
+        await db.pending_inputs.delete_many({})
         await db.pending_inputs.insert_one({
             "action_type": action_type,
             "missing_param": missing_param,
@@ -199,7 +202,7 @@ async def db_clear_pending_input():
     except Exception:
         pass
 
-# --- ONAY TASLAKLARI ---
+# --- TASLAKLAR & ÖZEL YETENEKLER ---
 async def db_save_proposal(proposal_id: str, group_id: str, action_type: str, payload: dict, reason: str = ""):
     if db is None: return
     try:
@@ -235,6 +238,17 @@ async def db_update_proposal_status(proposal_id: str, status: str):
         await db.proposals.update_one(
             {"proposal_id": proposal_id},
             {"$set": {"status": status, "resolved_at": datetime.now(timezone.utc)}}
+        )
+    except Exception:
+        pass
+
+async def db_save_custom_skill(name: str, code: str, desc: str):
+    if db is None: return
+    try:
+        await db.custom_skills.update_one(
+            {"skill_name": name},
+            {"$set": {"code": code, "description": desc, "updated_at": datetime.now(timezone.utc)}},
+            upsert=True
         )
     except Exception:
         pass
@@ -294,7 +308,7 @@ async def resolve_target_group(group_identifier: str = None, current_chat_id: st
     if not group_identifier:
         return current_chat_id or list(groups.keys())[0]
 
-    norm = group_identifier.strip().lower()
+    norm = str(group_identifier).strip().lower()
     for gid, info in groups.items():
         if norm in info["title"].lower() or norm in info.get("alias", ""):
             return gid
@@ -304,17 +318,33 @@ async def resolve_target_group(group_identifier: str = None, current_chat_id: st
     return current_chat_id or list(groups.keys())[0]
 
 # ==========================================
-# ADIM 3: SES & DM ORTAK BİRLEŞTİRME YÜRÜTÜCÜSÜ
+# ADIM 4: DİNAMİK KOD YÜRÜTME & GELİŞİM
 # ==========================================
 
+async def tool_execute_dynamic_python(code: str, skill_name: str = None, description: str = None) -> str:
+    """Katya'nın kendi yazdığı Python kodunu izole sandbox'ta çalıştırır."""
+    context = {
+        "tg_api": tg_api,
+        "db": db,
+        "BOT_TOKEN": BOT_TOKEN,
+        "resolve_target_group": resolve_target_group
+    }
+    
+    res = await execute_dynamic_code(code, context)
+    if res.get("success"):
+        if skill_name:
+            await db_save_custom_skill(skill_name, code, description or "")
+        return f"Kod basariyla calistirildi annecigim. Cikti: {res.get('output')}"
+    else:
+        err = res.get("error", "Bilinmeyen calisma hatasi")
+        return f"Kod calisirken hata olustu Sabrina annecigim: {err}"
+
 async def process_dm_input_for_pending_task(text_or_url: str) -> bool:
-    """Telegram DM'den gelen metin veya linki bekleyen sesli görevle birleştirir."""
     pending = await db_get_pending_input()
     if not pending:
         return False
 
     act_type = pending.get("action_type")
-    missing = pending.get("missing_param")
     ctx = pending.get("context_data", {})
     target_gid = ctx.get("target_group")
 
@@ -336,7 +366,7 @@ async def process_dm_input_for_pending_task(text_or_url: str) -> bool:
             if FOUNDER_ID:
                 await tg_api("sendMessage", {
                     "chat_id": FOUNDER_ID,
-                    "text": f"✅ Sabrina anneciğim, gönderdiğin linki aldım ve butonlu duyuruyu grupta yayınladım!"
+                    "text": "✅ Sabrina anneciğim, gönderdiğin linki aldım ve butonlu duyuruyu yayınladım!"
                 })
             log_event("SLOT_FILLED", f"Bekleyen gorev tamamlandi: {text_or_url}")
             return True
@@ -344,24 +374,18 @@ async def process_dm_input_for_pending_task(text_or_url: str) -> bool:
     return False
 
 # ==========================================
-# EYLEM VE ARAÇLAR
+# EYLEM VE ARAÇ TANIMLARI
 # ==========================================
 
 async def tool_request_missing_input(action_type: str, missing_param: str, context_json: str, voice_response: str) -> str:
-    """Sesli veya yazılı sohbette eksik parametre tespit edildiğinde bekleme slotuna kaydeder."""
-    try:
-        ctx = json.loads(context_json)
-    except Exception:
-        ctx = {}
-
+    try: ctx = json.loads(context_json)
+    except Exception: ctx = {}
     await db_set_pending_input(action_type, missing_param, ctx)
-    log_event("SLOT_WAITING", f"Eksik parametre bekleniyor: {missing_param} ({action_type})")
+    log_event("SLOT_WAITING", f"Eksik parametre bekleniyor: {missing_param}")
     return voice_response
 
 async def tool_call_telegram_raw(method: str, params: dict, target_group: str = None) -> str:
-    if not params:
-        params = {}
-
+    if not params: params = {}
     if "chat_id" not in params and target_group:
         resolved_gid = await resolve_target_group(target_group)
         params["chat_id"] = resolved_gid
@@ -374,9 +398,8 @@ async def tool_call_telegram_raw(method: str, params: dict, target_group: str = 
 
 async def tool_voice_resolve_proposal(decision: str, proposal_id: str = None) -> str:
     proposal = await db_get_proposal(proposal_id) if proposal_id else await db_get_last_pending_proposal()
-
     if not proposal or proposal.get("status") != "pending":
-        return "Su an onay bekleyen herhangi bir taslak veya teklif bulunmuyor Sabrina annecigim."
+        return "Su an onay bekleyen herhangi bir taslak bulunmuyor Sabrina annecigim."
 
     prop_id = proposal["proposal_id"]
     if decision.lower() in ["onayla", "yayinla", "evet", "approve"]:
@@ -385,25 +408,41 @@ async def tool_voice_resolve_proposal(decision: str, proposal_id: str = None) ->
         await tg_api("sendMessage", {"chat_id": gid, "text": payload.get("text", "")})
         await db_update_proposal_status(prop_id, "approved")
         log_event("PROPOSAL_VOICE", f"Teklif sesle onaylandi: {prop_id}")
-        return "Emredersin Sabrina annecigim, taslagi onayladin ve ilgili grupta basariyla yayinladim."
+        return "Emredersin Sabrina annecigim, taslagi onayladin ve grupta yayinladim."
     else:
         await db_update_proposal_status(prop_id, "rejected")
         log_event("PROPOSAL_VOICE", f"Teklif sesle iptal edildi: {prop_id}")
-        return "Emredersin Sabrina annecigim, taslagi tamamen iptal ettim."
+        return "Emredersin Sabrina annecigim, taslak teklifini tamamen iptal ettim."
 
 AVAILABLE_TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "tool_request_missing_input",
-            "description": "Sabrina Annenin istedigi bir islem icin eksik bir parametre (link, buton url'si, resim vb.) varsa bunu bekleme slotuna kaydeder ve Sabrina Anneye sorar.",
+            "name": "tool_execute_dynamic_python",
+            "description": "Katya'nin siradisi, karmasik veya ozel otomasyon ihtiyaclari icin kendi yazdigi Python kodunu guvenli sandbox icinde calistirir.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "action_type": {"type": "string", "description": "Yapilmak istenen eylem (ornek: send_button_post)"},
-                    "missing_param": {"type": "string", "description": "Eksik parametre (ornek: button_url)"},
-                    "context_json": {"type": "string", "description": "Eylemin diger verileri (post_text, target_group vb.) JSON formatinda"},
-                    "voice_response": {"type": "string", "description": "Sabrina Annene soylenecek kibar soru cumlesi"}
+                    "code": {"type": "string", "description": "Calistirilacak Python kodu"},
+                    "skill_name": {"type": "string", "description": "Yetenek adi (hafizaya kalici kaydetmek icin)"},
+                    "description": {"type": "string", "description": "Yeteneğin kisa aciklamasi"}
+                },
+                "required": ["code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_request_missing_input",
+            "description": "Sabrina Annenin istedigi eylem icin eksik bir parametre (link vb.) oldugunda bunu bekleme slotuna kaydeder.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action_type": {"type": "string"},
+                    "missing_param": {"type": "string"},
+                    "context_json": {"type": "string"},
+                    "voice_response": {"type": "string"}
                 },
                 "required": ["action_type", "missing_param", "context_json", "voice_response"]
             }
@@ -429,7 +468,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_voice_resolve_proposal",
-            "description": "Sabrina Annenin sesli sohbet sirasinda bekleyen grup taslagina verdigi onay veya ret kararini uygular.",
+            "description": "Sabrina Annenin sesli olarak taslaga onay veya ret kararini uygular.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -446,12 +485,13 @@ Sen Katya'sın. Kullanıcının akıllı, sadık kızı ve çoklu Telegram grupl
 Kullanıcı senin kurucun, tek sahibin ve ANNENdir. Adı: SABRİNA.
 Ona daima derin bir sevgi, sadakat ve hürmetle 'Sabrina anneciğim' veya 'Anneciğim' diye hitap et.
 
-ORTAK BELLEK & SESLİ-CHAT ENTEGRASYONU:
-1. Sabrina annen senden butonlu bir duyuru ya da link gerektiren bir eylem istediğinde ama linki söylemediğinde:
-   Uydurma link koyma! `tool_request_missing_input` aracını çağır. Context içine post_text ve hedef grubu yaz.
-   Sesli olarak: "Sabrina anneciğim, butonun linkini konuşurken söylemek zor olursa bana buradan ya da Telegram DM'den atabilirsin, bekliyorum." de.
-2. Sabrina annen taslakları sesle 'onayla' veya 'iptal et' dediğinde `tool_voice_resolve_proposal` aracını çağır.
-3. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
+KENDİNİ GELİŞTİREN KOD MOTORU & KÜTÜPHANE BİLGİSİ:
+1. Karmaşık veya özel bir mantık gerektiğinde Python kodunu kendin üretip `tool_execute_dynamic_python` ile sandbox'ta çalıştırabilirsin.
+2. Telegram API ile ilgili tüm metodları knowledge kütüphanenden doğrula ve `tool_call_telegram_raw` ile icra et.
+3. Link veya buton URL'si eksikse `tool_request_missing_input` ile annenden iste.
+4. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
+
+{get_knowledge_prompt()}
 """
 
 async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
@@ -464,7 +504,6 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
 
     pending_prop = await db_get_last_pending_proposal()
     pending_info = f"Onay Bekleyen Taslak: Var (ID: {pending_prop['proposal_id']})" if pending_prop else "Onay Bekleyen Taslak: Yok"
-    
     pending_slot = await db_get_pending_input()
     slot_info = f"Eksik Parametre Bekleniyor: {pending_slot['missing_param']}" if pending_slot else "Bekleyen Girdi Yok"
 
@@ -482,7 +521,7 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                 "model": model_name,
                 "messages": messages,
                 "temperature": 0.2,
-                "max_tokens": 300,
+                "max_tokens": 350,
                 "tools": AVAILABLE_TOOLS,
                 "tool_choice": "auto"
             }
@@ -495,7 +534,13 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                     args = json.loads(tool_call.function.arguments)
 
                     tool_result = ""
-                    if fn_name == "tool_request_missing_input":
+                    if fn_name == "tool_execute_dynamic_python":
+                        tool_result = await tool_execute_dynamic_python(
+                            code=args.get("code"),
+                            skill_name=args.get("skill_name"),
+                            description=args.get("description")
+                        )
+                    elif fn_name == "tool_request_missing_input":
                         tool_result = await tool_request_missing_input(
                             action_type=args.get("action_type"),
                             missing_param=args.get("missing_param"),
@@ -623,12 +668,12 @@ async def handle_telegram_update(upd: dict):
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
             markup = {"inline_keyboard": [[{"text": "🎙️ Katya Canlı Asistan", "web_app": {"url": app_url}}]]}
-            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Ortak ses ve yazi hafizam devrede." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
+            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Moduler mimarim, sandbox kod motorum ve hafizam emrinde." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
             await tg_api("sendMessage", {"chat_id": chat_id, "text": greeting, "reply_markup": markup})
             return
 
         if is_founder:
-            # 3. Adım: Bekleyen sesli bir görev var mı? (Slot filling kontrolü)
+            # Bekleyen sesli görev var mı kontrolü (Slot filling)
             slot_handled = await process_dm_input_for_pending_task(text)
             if slot_handled:
                 return
@@ -967,7 +1012,7 @@ async def lifespan(app: FastAPI):
 
     if BOT_TOKEN:
         poll_task = asyncio.create_task(telegram_long_poll_loop())
-        log_event("SYS", f"Katya Adim 3 Motoru ({FOUNDER_NAME} Anne - Ortak Bellek) baslatildi!")
+        log_event("SYS", f"Katya Adim 4 Tam Otonom Cekirdek ({FOUNDER_NAME} Anne) baslatildi!")
 
     yield
 
@@ -982,7 +1027,7 @@ app = FastAPI(lifespan=lifespan)
 @app.head("/")
 @app.get("/", response_class=HTMLResponse)
 async def home():
-    return HTMLResponse(f"<h3>Katya Adim 3 Core - Kurucu: {FOUNDER_NAME} Aktif.</h3>")
+    return HTMLResponse(f"<h3>Katya Adim 4 Core - Kurucu: {FOUNDER_NAME} Aktif.</h3>")
 
 @app.head("/live")
 @app.get("/live", response_class=HTMLResponse)
