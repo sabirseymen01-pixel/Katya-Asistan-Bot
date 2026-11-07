@@ -26,15 +26,22 @@ DEFAULT_GROUP_ID = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 KATYA_VOICE = "tr-TR-EmelNeural"
 
-# MongoDB Bağlantısı (TLS Sertifika Havuzu ile Güvenli Bağlantı)
+# MongoDB Bağlantısı (Sağlamlaştırılmış SSL / TLS Desteği)
 mongo_client = None
 db = None
 if MONGO_URI:
-    mongo_client = AsyncIOMotorClient(
-        MONGO_URI,
-        tlsCAFile=certifi.where()
-    )
-    db = mongo_client["katya_db"]
+    try:
+        mongo_client = AsyncIOMotorClient(
+            MONGO_URI,
+            tls=True,
+            tlsCAFile=certifi.where(),
+            tlsAllowInvalidCertificates=True,
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000
+        )
+        db = mongo_client["katya_db"]
+    except Exception as e:
+        print(f"[ERR] Mongo istemci olusturma hatasi: {e}", flush=True)
 
 scheduled_tasks = {}
 cached_active_models = []
@@ -53,98 +60,128 @@ async def init_db_indexes():
     if db is None:
         return
     try:
-        # 48 saat = 172800 saniye
+        await asyncio.sleep(2)  # Sunucu portunun acilmasina oncelik ver
         await db.messages.create_index("created_at", expireAfterSeconds=172800)
         await db.messages.create_index([("group_id", 1), ("message_id", 1)])
         await db.groups.create_index("group_id", unique=True)
         await db.warns.create_index([("group_id", 1), ("user_id", 1)], unique=True)
         log_event("SYS", "MongoDB indeksleri ve 48 saatlik mesaj deposu hazirlandi.")
     except Exception as e:
-        log_event("WARN", f"MongoDB indeks hatasi: {e}")
+        log_event("WARN", f"MongoDB indeks uyarisi (islem devam ediyor): {e}")
 
 async def db_save_group(group_id: str, title: str):
     if db is None: return
-    await db.groups.update_one(
-        {"group_id": str(group_id)},
-        {"$set": {"title": title, "updated_at": datetime.now(timezone.utc)}},
-        upsert=True
-    )
+    try:
+        await db.groups.update_one(
+            {"group_id": str(group_id)},
+            {"$set": {"title": title, "updated_at": datetime.now(timezone.utc)}},
+            upsert=True
+        )
+    except Exception:
+        pass
 
 async def db_get_groups():
     if db is None: return {}
-    cursor = db.groups.find({})
-    groups = {}
-    async for doc in cursor:
-        groups[doc["group_id"]] = {"title": doc.get("title", "Grup")}
-    return groups
+    try:
+        cursor = db.groups.find({})
+        groups = {}
+        async for doc in cursor:
+            groups[doc["group_id"]] = {"title": doc.get("title", "Grup")}
+        return groups
+    except Exception:
+        return {}
 
 async def db_save_rule(group_id: str, rule_text: str):
     if db is None: return
-    await db.rules.insert_one({
-        "group_id": str(group_id),
-        "rule": rule_text,
-        "created_at": datetime.now(timezone.utc)
-    })
+    try:
+        await db.rules.insert_one({
+            "group_id": str(group_id),
+            "rule": rule_text,
+            "created_at": datetime.now(timezone.utc)
+        })
+    except Exception:
+        pass
 
 async def db_get_rules(group_id: str):
     if db is None: return []
-    cursor = db.rules.find({"$or": [{"group_id": str(group_id)}, {"group_id": "GLOBAL"}]})
-    rules = []
-    async for doc in cursor:
-        rules.append(doc["rule"])
-    return rules
+    try:
+        cursor = db.rules.find({"$or": [{"group_id": str(group_id)}, {"group_id": "GLOBAL"}]})
+        rules = []
+        async for doc in cursor:
+            rules.append(doc["rule"])
+        return rules
+    except Exception:
+        return []
 
 async def db_record_message(group_id: str, message_id: int, user_id: int, user_name: str, text: str):
     if db is None: return
-    await db.messages.insert_one({
-        "group_id": str(group_id),
-        "message_id": message_id,
-        "user_id": user_id,
-        "user_name": user_name,
-        "text": text,
-        "created_at": datetime.now(timezone.utc)
-    })
+    try:
+        await db.messages.insert_one({
+            "group_id": str(group_id),
+            "message_id": message_id,
+            "user_id": user_id,
+            "user_name": user_name,
+            "text": text,
+            "created_at": datetime.now(timezone.utc)
+        })
+    except Exception:
+        pass
 
 async def db_get_recent_messages(group_id: str, limit: int = 50, user_id: int = None, text_contains: str = None):
     if db is None: return []
-    query = {"group_id": str(group_id)}
-    if user_id:
-        query["user_id"] = user_id
-    if text_contains:
-        query["text"] = {"$regex": re.escape(text_contains), "$options": "i"}
+    try:
+        query = {"group_id": str(group_id)}
+        if user_id:
+            query["user_id"] = user_id
+        if text_contains:
+            query["text"] = {"$regex": re.escape(text_contains), "$options": "i"}
 
-    cursor = db.messages.find(query).sort("message_id", -1).limit(limit)
-    messages = []
-    async for doc in cursor:
-        messages.append(doc)
-    return messages
+        cursor = db.messages.find(query).sort("message_id", -1).limit(limit)
+        messages = []
+        async for doc in cursor:
+            messages.append(doc)
+        return messages
+    except Exception:
+        return []
 
 async def db_get_and_inc_warn(group_id: str, user_id: int):
     if db is None: return 1
-    res = await db.warns.find_one_and_update(
-        {"group_id": str(group_id), "user_id": user_id},
-        {"$inc": {"count": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}},
-        upsert=True,
-        return_document=True
-    )
-    return res.get("count", 1)
+    try:
+        res = await db.warns.find_one_and_update(
+            {"group_id": str(group_id), "user_id": user_id},
+            {"$inc": {"count": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}},
+            upsert=True,
+            return_document=True
+        )
+        return res.get("count", 1)
+    except Exception:
+        return 1
 
 async def db_reset_warn(group_id: str, user_id: int):
     if db is None: return
-    await db.warns.delete_one({"group_id": str(group_id), "user_id": user_id})
+    try:
+        await db.warns.delete_one({"group_id": str(group_id), "user_id": user_id})
+    except Exception:
+        pass
 
 async def db_save_group_config(group_id: str, key: str, value: str):
     if db is None: return
-    await db.configs.update_one(
-        {"group_id": str(group_id)},
-        {"$set": {key: value, "updated_at": datetime.now(timezone.utc)}},
-        upsert=True
-    )
+    try:
+        await db.configs.update_one(
+            {"group_id": str(group_id)},
+            {"$set": {key: value, "updated_at": datetime.now(timezone.utc)}},
+            upsert=True
+        )
+    except Exception:
+        pass
 
 async def db_get_group_config(group_id: str):
     if db is None: return {}
-    doc = await db.configs.find_one({"group_id": str(group_id)})
-    return doc or {}
+    try:
+        doc = await db.configs.find_one({"group_id": str(group_id)})
+        return doc or {}
+    except Exception:
+        return {}
 
 # ==========================================
 # YARDIMCI VE LLM HAZIRLIK
@@ -199,7 +236,10 @@ async def tool_delete_messages(group_id: str, count: int = 1, user_id: int = Non
         if res and res.get("ok"):
             deleted += 1
             if db is not None:
-                await db.messages.delete_one({"_id": d["_id"]})
+                try:
+                    await db.messages.delete_one({"_id": d["_id"]})
+                except Exception:
+                    pass
 
     log_event("ACTION", f"Grup ({group_id}) {deleted} mesaj silindi.")
     return f"{deleted} adet mesaj basariyla silindi annecigim."
@@ -1177,16 +1217,23 @@ class ChatPayload(BaseModel):
     message: str
 
 poll_task = None
+db_index_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global poll_task
-    await init_db_indexes()
+    global poll_task, db_index_task
+    
+    # 1. Groq modellerini onbellege al
     await refresh_groq_models()
 
+    # 2. MongoDB indekslemesini arka planda baslat (Portun hemen acilmasini saglar, Render kapanmaz)
+    if db is not None:
+        db_index_task = asyncio.create_task(init_db_indexes())
+
+    # 3. Telegram Polling'i aninda baslat
     if BOT_TOKEN:
         poll_task = asyncio.create_task(telegram_long_poll_loop())
-        log_event("SYS", "Katya MongoDB coklu grup motoru devrede!")
+        log_event("SYS", "Katya coklu grup motoru ve Telegram dinleyicisi baslatildi!")
 
     yield
 
@@ -1194,6 +1241,8 @@ async def lifespan(app: FastAPI):
     polling_running = False
     if poll_task:
         poll_task.cancel()
+    if db_index_task:
+        db_index_task.cancel()
     for t in scheduled_tasks.values():
         t.cancel()
     if mongo_client:
