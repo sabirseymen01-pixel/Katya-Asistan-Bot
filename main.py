@@ -1,6 +1,5 @@
 import os
 import re
-import ssl
 import json
 import asyncio
 import base64
@@ -27,22 +26,17 @@ DEFAULT_GROUP_ID = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 KATYA_VOICE = "tr-TR-EmelNeural"
 
-# MongoDB Bağlantısı (SSL Handshake Uyumlu Güvenli Yapılandırma)
+# MongoDB Bağlantısı (Motor / PyMongo Standart TLS Yapılandırması)
 mongo_client = None
 db = None
 
 if MONGO_URI:
     try:
-        ssl_ctx = ssl.create_default_context(cafile=certifi.where())
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-
         mongo_client = AsyncIOMotorClient(
             MONGO_URI,
-            tls=True,
-            ssl_context=ssl_ctx,
-            serverSelectionTimeoutMS=4000,
-            connectTimeoutMS=4000
+            tlsCAFile=certifi.where(),
+            serverSelectionTimeoutMS=5000,
+            connectTimeoutMS=5000
         )
         db = mongo_client["katya_db"]
     except Exception as e:
