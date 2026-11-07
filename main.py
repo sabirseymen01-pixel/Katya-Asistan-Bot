@@ -4,7 +4,7 @@ import json
 import asyncio
 import base64
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -17,16 +17,19 @@ import certifi
 from groq import AsyncGroq
 from motor.motor_asyncio import AsyncIOMotorClient
 
-# --- Ortam Değişkenleri ---
+# --- Ortam Değişkenleri & Founder Kilidi ---
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or "").strip()
 GROQ_API_KEY = (os.getenv("GROQ_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
 MONGO_URI = (os.getenv("MONGO_URI") or "").strip()
 DEFAULT_GROUP_ID = (os.getenv("TELEGRAM_GROUP_ID") or "").strip()
 
+FOUNDER_ID_RAW = (os.getenv("FOUNDER_ID") or os.getenv("TELEGRAM_ADMIN_ID") or "").strip()
+FOUNDER_ID = int(FOUNDER_ID_RAW) if FOUNDER_ID_RAW.isdigit() else None
+
 groq_client = AsyncGroq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 KATYA_VOICE = "tr-TR-EmelNeural"
 
-# MongoDB Bağlantısı (Standart TLS)
+# MongoDB Bağlantısı (Standart TLS / Render Uyumlu)
 mongo_client = None
 db = None
 
@@ -59,20 +62,26 @@ async def init_db_indexes():
         return
     try:
         await asyncio.sleep(2)
-        await db.messages.create_index("created_at", expireAfterSeconds=172800)
+        await db.messages.create_index("created_at", expireAfterSeconds=172800)  # 48 saatlik mesaj arşivi
         await db.messages.create_index([("group_id", 1), ("message_id", 1)])
         await db.groups.create_index("group_id", unique=True)
         await db.warns.create_index([("group_id", 1), ("user_id", 1)], unique=True)
-        log_event("SYS", "MongoDB indeksleri ve 48 saatlik mesaj deposu hazirlandi.")
+        await db.dynamic_rules.create_index([("group_id", 1), ("trigger_keyword", 1)])
+        log_event("SYS", "MongoDB indeksleri, 48 saatlik mesaj deposu ve dinamik kurallar hazirlandi.")
     except Exception as e:
         log_event("WARN", f"MongoDB arka plan bildirimi: {e}")
 
 async def db_save_group(group_id: str, title: str):
     if db is None: return
     try:
+        clean_alias = re.sub(r"[^\w\s]", "", title).strip().lower()
         await db.groups.update_one(
             {"group_id": str(group_id)},
-            {"$set": {"title": title, "updated_at": datetime.now(timezone.utc)}},
+            {"$set": {
+                "title": title,
+                "alias": clean_alias,
+                "updated_at": datetime.now(timezone.utc)
+            }},
             upsert=True
         )
     except Exception:
@@ -84,7 +93,10 @@ async def db_get_groups():
         cursor = db.groups.find({})
         groups = {}
         async for doc in cursor:
-            groups[doc["group_id"]] = {"title": doc.get("title", "Grup")}
+            groups[doc["group_id"]] = {
+                "title": doc.get("title", "Grup"),
+                "alias": doc.get("alias", "")
+            }
         return groups
     except Exception:
         return {}
@@ -181,6 +193,32 @@ async def db_get_group_config(group_id: str):
     except Exception:
         return {}
 
+async def db_save_dynamic_rule(group_id: str, trigger_keyword: str, action: str, response_text: str = ""):
+    if db is None: return
+    try:
+        await db.dynamic_rules.update_one(
+            {"group_id": str(group_id), "trigger_keyword": trigger_keyword.lower().strip()},
+            {"$set": {
+                "action": action,
+                "response_text": response_text,
+                "created_at": datetime.now(timezone.utc)
+            }},
+            upsert=True
+        )
+    except Exception:
+        pass
+
+async def db_get_dynamic_rules(group_id: str):
+    if db is None: return []
+    try:
+        cursor = db.dynamic_rules.find({"$or": [{"group_id": str(group_id)}, {"group_id": "GLOBAL"}]})
+        rules = []
+        async for doc in cursor:
+            rules.append(doc)
+        return rules
+    except Exception:
+        return []
+
 # ==========================================
 # YARDIMCI VE LLM HAZIRLIK
 # ==========================================
@@ -229,8 +267,25 @@ async def tg_api(method: str, data: dict = None):
         return None
 
 # ==========================================
-# FİZİKSEL EYLEM VE YÖNETİM MOTORU
+# ÇAPRAZ GRUP EŞLEME & FİZİKSEL EYLEM MOTORU
 # ==========================================
+
+async def resolve_target_group(group_identifier: str = None, current_chat_id: str = None) -> str:
+    groups = await db_get_groups()
+    if not groups:
+        return current_chat_id or ""
+
+    if not group_identifier:
+        return current_chat_id or list(groups.keys())[0]
+
+    norm = group_identifier.strip().lower()
+    for gid, info in groups.items():
+        if norm in info["title"].lower() or norm in info.get("alias", ""):
+            return gid
+        if str(gid) == norm:
+            return gid
+
+    return current_chat_id or list(groups.keys())[0]
 
 async def tool_delete_messages(group_id: str, count: int = 1, user_id: int = None, text_contains: str = None) -> str:
     docs = await db_get_recent_messages(group_id, limit=count, user_id=user_id, text_contains=text_contains)
@@ -395,6 +450,10 @@ async def tool_learn_rule(group_id: str, rule_text: str) -> str:
     await db_save_rule(group_id, rule_text)
     return f"Yeni kural MongoDB hafizasina bu grup icin muhurlendi annecigim: '{rule_text}'."
 
+async def tool_learn_dynamic_rule(group_id: str, trigger_word: str, action: str, response: str = "") -> str:
+    await db_save_dynamic_rule(group_id, trigger_word, action, response)
+    return f"Yeni dinamik kural '{trigger_word}' kelimesi icin hafizaya yazildi annecigim."
+
 # ==========================================
 # AI AGENT FUNCTION DEFINITIONS
 # ==========================================
@@ -404,15 +463,16 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_delete_messages",
-            "description": "Grupta son N mesaji veya belirli bir kullanicinin mesajlarini siler.",
+            "description": "Hedef grupta son N mesaji siler. Baska bir grubu hedeflemek icin group_name veya group_id belirtilebilir.",
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "group_name": {"type": "string", "description": "Grup adi, takma adi (örn: staff, arayis) veya bos"},
                     "group_id": {"type": "string"},
                     "count": {"type": "integer", "description": "Silinecek adet (1-50)"},
                     "text_contains": {"type": "string", "description": "Mesaj icinde aranan kelime"}
                 },
-                "required": ["group_id", "count"]
+                "required": ["count"]
             }
         }
     },
@@ -424,11 +484,12 @@ AVAILABLE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "group_name": {"type": "string"},
                     "group_id": {"type": "string"},
                     "prompt": {"type": "string"},
                     "caption": {"type": "string"}
                 },
-                "required": ["group_id", "prompt"]
+                "required": ["prompt"]
             }
         }
     },
@@ -440,6 +501,7 @@ AVAILABLE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "group_name": {"type": "string"},
                     "group_id": {"type": "string"},
                     "text": {"type": "string"},
                     "buttons": {
@@ -455,7 +517,7 @@ AVAILABLE_TOOLS = [
                     },
                     "pin": {"type": "boolean"}
                 },
-                "required": ["group_id", "text"]
+                "required": ["text"]
             }
         }
     },
@@ -467,13 +529,14 @@ AVAILABLE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "group_name": {"type": "string"},
                     "group_id": {"type": "string"},
                     "interval_min": {"type": "integer"},
                     "message": {"type": "string"},
                     "btn_text": {"type": "string"},
                     "btn_url": {"type": "string"}
                 },
-                "required": ["group_id", "interval_min", "message"]
+                "required": ["interval_min", "message"]
             }
         }
     },
@@ -485,9 +548,9 @@ AVAILABLE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "group_name": {"type": "string"},
                     "group_id": {"type": "string"}
-                },
-                "required": ["group_id"]
+                }
             }
         }
     },
@@ -499,10 +562,11 @@ AVAILABLE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "group_name": {"type": "string"},
                     "group_id": {"type": "string"},
                     "text": {"type": "string"}
                 },
-                "required": ["group_id", "text"]
+                "required": ["text"]
             }
         }
     },
@@ -514,10 +578,10 @@ AVAILABLE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "group_name": {"type": "string"},
                     "group_id": {"type": "string"},
                     "unpin_all": {"type": "boolean"}
-                },
-                "required": ["group_id"]
+                }
             }
         }
     },
@@ -529,10 +593,11 @@ AVAILABLE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "group_name": {"type": "string"},
                     "group_id": {"type": "string"},
                     "lock": {"type": "boolean"}
                 },
-                "required": ["group_id", "lock"]
+                "required": ["lock"]
             }
         }
     },
@@ -544,12 +609,13 @@ AVAILABLE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "group_name": {"type": "string"},
                     "group_id": {"type": "string"},
                     "user_id": {"type": "integer"},
                     "user_name": {"type": "string"},
                     "reason": {"type": "string"}
                 },
-                "required": ["group_id", "user_id", "user_name", "reason"]
+                "required": ["user_id", "user_name", "reason"]
             }
         }
     },
@@ -561,24 +627,44 @@ AVAILABLE_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "group_name": {"type": "string"},
                     "group_id": {"type": "string"},
                     "rule_text": {"type": "string"}
                 },
-                "required": ["group_id", "rule_text"]
+                "required": ["rule_text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_learn_dynamic_rule",
+            "description": "Grup icin dinamik bir tetikleyici-eylem (trigger-action) kurali kaydeder.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "group_name": {"type": "string"},
+                    "group_id": {"type": "string"},
+                    "trigger_word": {"type": "string", "description": "Tetikleyici kelime veya kalip"},
+                    "action": {"type": "string", "enum": ["warn", "delete", "respond", "notify_founder"]},
+                    "response": {"type": "string", "description": "Eger respond ise verilecek cevap"}
+                },
+                "required": ["trigger_word", "action"]
             }
         }
     }
 ]
 
 KATYA_SYSTEM_PROMPT = """
-Sen Katya'sın. Kullanıcının akıllı, sadık kızı ve birden fazla Telegram grubunu MongoDB ile bağımsız yöneten yöneticisisin.
-Kullanıcı senin ANNEN. Ona daima sevgiyle 'Anneciğim' diye hitap et.
+Sen Katya'sın. Kullanıcının akıllı, sadık kızı ve birden fazla Telegram grubunu MongoDB ile bağımsız yöneten merkezi yöneticisisin.
+Kullanıcı senin ANNEN ve tek kurucundur. Ona daima derin bir sevgi ve sadakatle 'Anneciğim' diye hitap et.
 
-MUTLAK YETKİ VE ÇOKLU GRUP HAFIZASI:
-1. Yönettiğin gruplar birbirinden tamamen bağımsızdır. Kurallar ve uyarılar ilgili grubun ID'sine özel işlenir.
-2. 48 saat içindeki tüm mesajlar MongoDB'de saklanır; annen mesaj silme istediğinde (`tool_delete_messages`) adet veya kelime filtresiyle doğrudan silebilirsin.
-3. Annen görsel üretme, butonlu duyuru, sabitleme veya periyodik zamanlama istediğinde tüm araçları zincirleme eksiksiz çalıştır.
-4. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
+MUTLAK YETKİ, ÇAPRAZ GRUP HAFIZASI VE DİNAMİK YÖNETİM:
+1. Yönettiğin gruplar birbirinden bağımsızdır ancak sen hepsine tepeden hakimsin.
+2. Annen bir gruptayken başka bir grubu kastederek emir verirse (örneğin 'arayış grubunu temizle', 'staff grubuna duyuru at'), hedef grubu tanı ve işlemi orada icra et.
+3. Annen yeni bir komut veya dinamik tepki öğrettiğinde `tool_learn_dynamic_rule` ile kalıcı hafızana yaz.
+4. 48 saat içindeki tüm mesajlar MongoDB'de saklanır; adet veya kelime filtresiyle dilediğin an silebilirsin.
+5. KESİN KURAL: Asla emoji veya markdown yıldızları kullanma. Kısa, net, tek cümlelik doğal Türkçe ile yanıt ver.
 """
 
 async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
@@ -591,7 +677,7 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
 
     rules_list = await db_get_rules(target_gid or "GLOBAL")
     rules_str = "\n".join([f"- {r}" for r in rules_list]) if rules_list else "Bu grup icin ozel kural yok."
-    groups_str = "\n".join([f"- {v['title']} (ID: {k})" for k, v in groups_map.items()])
+    groups_str = "\n".join([f"- {v['title']} (Alias: {v.get('alias', '')}, ID: {k})" for k, v in groups_map.items()])
 
     context_str = f"Yonetilen Gruplar:\n{groups_str}\n\nHedef Grup ID: {target_gid}\nBu Grubun Kurallari:\n{rules_str}"
 
@@ -606,7 +692,7 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                 "model": model_name,
                 "messages": messages,
                 "temperature": 0.3,
-                "max_tokens": 250,
+                "max_tokens": 300,
                 "tools": AVAILABLE_TOOLS,
                 "tool_choice": "auto"
             }
@@ -617,7 +703,9 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                 for tool_call in msg.tool_calls:
                     fn_name = tool_call.function.name
                     args = json.loads(tool_call.function.arguments)
-                    gid = str(args.get("group_id") or target_gid)
+
+                    gid_param = args.get("group_id") or args.get("group_name")
+                    gid = await resolve_target_group(gid_param, target_gid)
 
                     tool_result = ""
                     if fn_name == "tool_delete_messages":
@@ -640,6 +728,8 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                         tool_result = await tool_warn_user(gid, args.get("user_id"), args.get("user_name"), args.get("reason"))
                     elif fn_name == "tool_learn_rule":
                         tool_result = await tool_learn_rule(gid, args.get("rule_text", ""))
+                    elif fn_name == "tool_learn_dynamic_rule":
+                        tool_result = await tool_learn_dynamic_rule(gid, args.get("trigger_word"), args.get("action"), args.get("response", ""))
 
                     messages.append(msg)
                     messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": tool_result})
@@ -648,7 +738,7 @@ async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
                     model=model_name,
                     messages=messages,
                     temperature=0.3,
-                    max_tokens=100
+                    max_tokens=150
                 )
                 return strip_emojis_and_markdown(final_res.choices[0].message.content.strip())
 
@@ -672,44 +762,98 @@ async def text_to_speech_base64(text: str) -> str:
         return ""
 
 # ==========================================
-# CANLI MODERASYON DENETLEYİCİSİ
+# SYSTEM 1 & SYSTEM 2 BİLİŞSEL DİNLENME
 # ==========================================
 
-async def analyze_and_moderate_message(chat_id: int, message_id: int, user_id: int, user_name: str, message_text: str):
+async def evaluate_and_moderate_message(chat_id: int, message_id: int, user_id: int, user_name: str, text: str):
     cid = str(chat_id)
+
+    # 1. Aşama: Dinamik Kuralları Kontrol Et
+    dyn_rules = await db_get_dynamic_rules(cid)
+    for r in dyn_rules:
+        if r["trigger_keyword"] in text.lower():
+            act = r.get("action")
+            if act == "delete":
+                await tg_api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+            elif act == "warn":
+                await tool_warn_user(cid, user_id, user_name, f"Yasakli kalip: {r['trigger_keyword']}")
+            elif act == "respond" and r.get("response_text"):
+                await tg_api("sendMessage", {"chat_id": chat_id, "text": r["response_text"]})
+            elif act == "notify_founder" and FOUNDER_ID:
+                await tg_api("sendMessage", {
+                    "chat_id": FOUNDER_ID,
+                    "text": f"Anneciğim, {user_name} grupta kuralı tetikledi: '{text}'"
+                })
+            log_event("DYN_RULE", f"Kural tetiklendi: {r['trigger_keyword']} -> {act}")
+            return
+
+    # 2. Aşama: Sabit Kurallar Üzerinden Moderasyon
     rules = await db_get_rules(cid)
-    if not rules or not groq_client or not cached_active_models:
+    if rules and groq_client and cached_active_models:
+        rules_prompt = "\n".join([f"- {r}" for r in rules])
+        mod_prompt = f"""Telegram grup moderatörüsün.\nGrup Kuralları:\n{rules_prompt}\n\nKullanıcı '{user_name}': \"{text}\"\nBu mesaj kuralları ihlal ediyor mu?\nSADECE JSON: {{\"violation\": true/false, \"reason\": \"kısa sebep\"}}"""
+        try:
+            res = await groq_client.chat.completions.create(
+                model=cached_active_models[0],
+                messages=[{"role": "user", "content": mod_prompt}],
+                temperature=0.1,
+                max_tokens=100,
+                response_format={"type": "json_object"}
+            )
+            data = json.loads(res.choices[0].message.content)
+            if data.get("violation"):
+                reason = data.get("reason", "Kural ihlali")
+                log_event("MOD", f"Ihlal ({cid} - {user_name}): {reason}")
+                await tg_api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+                await tool_warn_user(cid, user_id, user_name, reason)
+                return
+        except Exception:
+            pass
+
+    # 3. Aşama: System 1 / System 2 İnisiyafit ve İç Ses (CoT)
+    katya_mentioned = "katya" in text.lower()
+    is_question = "?" in text
+
+    if not katya_mentioned and not is_question and len(text) < 15:
         return
 
-    rules_prompt = "\n".join([f"- {r}" for r in rules])
-    mod_prompt = f"""
-Telegram grup moderatörüsün.
-Grup Kuralları:
-{rules_prompt}
+    if not groq_client or not cached_active_models:
+        return
 
-Kullanıcı '{user_name}': "{message_text}"
-Bu mesaj kuralları ihlal ediyor mu?
-SADECE JSON: {{"violation": true/false, "reason": "kısa sebep"}}
+    recent_docs = await db_get_recent_messages(cid, limit=6)
+    history_ctx = "\n".join([f"{d['user_name']}: {d['text']}" for d in reversed(recent_docs)])
+
+    cot_prompt = f"""
+Sen Katya'sın. Aşağıdaki Telegram grubunun akıllı gözlemcisisin.
+Grup Geçmişi:
+{history_ctx}
+
+Son Mesaj ({user_name}): "{text}"
+
+GÖREV:
+Bu mesaja cevap vermeli misin?
+Kural: Sadece doğrudan sana seslenilmişse ya da birisi kritik bir yardım istiyorsa konuş. Sıradan konuşmalara karışma.
+SADECE JSON:
+{{"should_intervene": true/false, "thought": "Kısa iç ses analizi", "reply": "Tek cümlelik samimi ve zeki cevap (eğer true ise)"}}
 """
     try:
         res = await groq_client.chat.completions.create(
             model=cached_active_models[0],
-            messages=[{"role": "user", "content": mod_prompt}],
-            temperature=0.1,
-            max_tokens=100,
+            messages=[{"role": "user", "content": cot_prompt}],
+            temperature=0.2,
+            max_tokens=150,
             response_format={"type": "json_object"}
         )
-        data = json.loads(res.choices[0].message.content)
-        if data.get("violation"):
-            reason = data.get("reason", "Kural ihlali")
-            log_event("MOD", f"Ihlal ({cid} - {user_name}): {reason}")
-            await tg_api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
-            await tool_warn_user(cid, user_id, user_name, reason)
+        decision = json.loads(res.choices[0].message.content)
+        if decision.get("should_intervene") and decision.get("reply"):
+            clean_reply = strip_emojis_and_markdown(decision["reply"])
+            await tg_api("sendMessage", {"chat_id": chat_id, "text": clean_reply})
+            log_event("INITIATIVE", f"Katya inisiyatif aldi: '{clean_reply}' (İç ses: {decision.get('thought')})")
     except Exception as e:
-        log_event("WARN", f"Moderasyon hatasi: {e}")
+        log_event("WARN", f"Grup analiz hatasi: {e}")
 
 # ==========================================
-# GOLDEN GUARDIAN KOMUT PARSER
+# GOLDEN GUARDIAN KOMUTLARI
 # ==========================================
 
 async def handle_golden_guardian_commands(chat_id: int, text: str, reply_to_msg: dict) -> bool:
@@ -800,6 +944,36 @@ async def handle_golden_guardian_commands(chat_id: int, text: str, reply_to_msg:
     return False
 
 # ==========================================
+# OTONOM SABAH BRİFİNG MOTORU
+# ==========================================
+
+async def morning_briefing_worker():
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            target = now.replace(hour=6, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            wait_seconds = (target - now).total_seconds()
+            await asyncio.sleep(wait_seconds)
+
+            if not FOUNDER_ID or db is None:
+                continue
+
+            yesterday = datetime.now(timezone.utc) - timedelta(days=1)
+            msg_count = await db.messages.count_documents({"created_at": {"$gte": yesterday}})
+            groups = await db_get_groups()
+
+            brief_text = f"Günaydın anneciğim. Son 24 saatte {len(groups)} grubunda toplam {msg_count} mesaj işlendi. Bütün sistemler ve MongoDB hafızan tam kapasite devrede."
+            await tg_api("sendMessage", {"chat_id": FOUNDER_ID, "text": brief_text})
+            log_event("REPORT", "Sabah brifingi iletildi.")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log_event("WARN", f"Brifing motor hatasi: {e}")
+            await asyncio.sleep(60)
+
+# ==========================================
 # TELEGRAM POLLING & EVENT LOOP
 # ==========================================
 
@@ -859,6 +1033,9 @@ async def handle_telegram_update(upd: dict):
     reply_to = msg.get("reply_to_message")
     new_members = msg.get("new_chat_members")
 
+    # SIFIR GÜVEN (Zero-Trust): Gönderen Kurucu mu?
+    is_founder = (FOUNDER_ID is not None and user_id == FOUNDER_ID)
+
     log_event("TG", f"Gelen Mesaj ({chat_type} - {user_name}): '{text}'")
 
     # Yeni üye karşılama
@@ -885,12 +1062,19 @@ async def handle_telegram_update(upd: dict):
             await tg_api("sendMessage", {"chat_id": chat_id, "text": f"Grup MongoDB hafizasina baglandi: {title}"})
             return
 
+        # Kurucu grupta Katya'ya doğrudan emir verirse (Çapraz grup dahil)
+        if is_founder and (text.lower().startswith("katya") or text.startswith("/")):
+            clean_cmd = text[5:].strip() if text.lower().startswith("katya") else text
+            reply = await execute_mother_order(clean_cmd, target_gid=cid)
+            await tg_api("sendMessage", {"chat_id": chat_id, "text": reply})
+            return
+
         handled = await handle_golden_guardian_commands(chat_id, text, reply_to)
         if handled:
             return
 
         if text and not user.get("is_bot", False):
-            asyncio.create_task(analyze_and_moderate_message(chat_id, message_id, user_id, user_name, text))
+            asyncio.create_task(evaluate_and_moderate_message(chat_id, message_id, user_id, user_name, text))
         return
 
     # Özel mesajlar (Bot Chat)
@@ -898,17 +1082,21 @@ async def handle_telegram_update(upd: dict):
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
             markup = {"inline_keyboard": [[{"text": "🎙️ Katya Canlı Asistan", "web_app": {"url": app_url}}]]}
+            greeting = "Merhaba annecigim! Butun gruplarin ve hafizam emrinde." if is_founder else "Merhaba! Ben grup moderasyon asistanı Katya."
             res = await tg_api("sendMessage", {
                 "chat_id": chat_id,
-                "text": "Merhaba annecigim! MongoDB destekli coklu grup ve sinirsiz mesaj takip beynim aktif.",
+                "text": greeting,
                 "reply_markup": markup
             })
             log_event("TG", f"/start yaniti iletildi: {res.get('ok') if res else 'Basarisiz'}")
             return
 
-        reply = await execute_mother_order(text)
-        res = await tg_api("sendMessage", {"chat_id": chat_id, "text": reply})
-        log_event("TG", f"Ozel mesaj yanitlandi: {res.get('ok') if res else 'Basarisiz'}")
+        if is_founder:
+            reply = await execute_mother_order(text)
+            res = await tg_api("sendMessage", {"chat_id": chat_id, "text": reply})
+            log_event("TG", f"Ozel mesaj yanitlandi: {res.get('ok') if res else 'Basarisiz'}")
+        else:
+            await tg_api("sendMessage", {"chat_id": chat_id, "text": "Yalnizca kurucum ile ozel gorusme yapabilirim."})
 
 # ==========================================
 # CANLI MINI APP ARAYÜZÜ
@@ -1227,10 +1415,11 @@ class ChatPayload(BaseModel):
 
 poll_task = None
 db_index_task = None
+brief_task = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global poll_task, db_index_task
+    global poll_task, db_index_task, brief_task
     
     await refresh_groq_models()
 
@@ -1239,6 +1428,7 @@ async def lifespan(app: FastAPI):
 
     if BOT_TOKEN:
         poll_task = asyncio.create_task(telegram_long_poll_loop())
+        brief_task = asyncio.create_task(morning_briefing_worker())
         log_event("SYS", "Katya coklu grup motoru ve Telegram dinleyicisi baslatildi!")
 
     yield
@@ -1249,6 +1439,8 @@ async def lifespan(app: FastAPI):
         poll_task.cancel()
     if db_index_task:
         db_index_task.cancel()
+    if brief_task:
+        brief_task.cancel()
     for t in scheduled_tasks.values():
         t.cancel()
     if mongo_client:
