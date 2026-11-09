@@ -61,12 +61,11 @@ def log_event(level: str, message: str):
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 # ==========================================
-# MONGODB ÇOKLU GRUP, KURUCU & ORTAK BELLEK
+# MONGODB DEPOLAMA & EYLEM DEFTERİ (UNDO)
 # ==========================================
 
 async def init_db_indexes():
-    if db is None:
-        return
+    if db is None: return
     try:
         await asyncio.sleep(2)
         await db.messages.create_index("created_at", expireAfterSeconds=172800)
@@ -75,9 +74,9 @@ async def init_db_indexes():
         await db.warns.create_index([("group_id", 1), ("user_id", 1)], unique=True)
         await db.dynamic_rules.create_index([("group_id", 1), ("trigger_keyword", 1)])
         await db.bot_sent_messages.create_index([("group_id", 1), ("message_id", 1)])
-        await db.proposals.create_index("proposal_id", unique=True)
-        await db.proposals.create_index("created_at", expireAfterSeconds=86400)
+        await db.action_ledger.create_index("created_at", expireAfterSeconds=604800)
         await db.pending_inputs.create_index("created_at", expireAfterSeconds=3600)
+        await db.group_settings.create_index("group_id", unique=True)
         await db.custom_skills.create_index("skill_name", unique=True)
         
         if FOUNDER_ID:
@@ -107,8 +106,7 @@ async def db_save_group(group_id: str, title: str):
             }},
             upsert=True
         )
-    except Exception:
-        pass
+    except Exception: pass
 
 async def db_get_groups():
     if db is None: return {}
@@ -116,13 +114,9 @@ async def db_get_groups():
         cursor = db.groups.find({})
         groups = {}
         async for doc in cursor:
-            groups[doc["group_id"]] = {
-                "title": doc.get("title", "Grup"),
-                "alias": doc.get("alias", "")
-            }
+            groups[doc["group_id"]] = {"title": doc.get("title", "Grup"), "alias": doc.get("alias", "")}
         return groups
-    except Exception:
-        return {}
+    except Exception: return {}
 
 async def db_record_message(group_id: str, message_id: int, user_id: int, user_name: str, text: str):
     if db is None: return
@@ -135,8 +129,49 @@ async def db_record_message(group_id: str, message_id: int, user_id: int, user_n
             "text": text,
             "created_at": datetime.now(timezone.utc)
         })
-    except Exception:
-        pass
+    except Exception: pass
+
+async def db_record_action(action_type: str, group_id: str, target_id: int = None, message_id: int = None, details: dict = None):
+    if db is None: return
+    try:
+        await db.action_ledger.insert_one({
+            "action_type": action_type,
+            "group_id": str(group_id),
+            "target_id": target_id,
+            "message_id": message_id,
+            "details": details or {},
+            "created_at": datetime.now(timezone.utc)
+        })
+    except Exception: pass
+
+async def db_get_last_action(group_id: str = None):
+    if db is None: return None
+    try:
+        query = {"group_id": str(group_id)} if group_id else {}
+        return await db.action_ledger.find_one(query, sort=[("created_at", -1)])
+    except Exception: return None
+
+async def db_delete_action_record(doc_id):
+    if db is None: return
+    try: await db.action_ledger.delete_one({"_id": doc_id})
+    except Exception: pass
+
+async def db_get_group_settings(group_id: str):
+    if db is None: return {}
+    try:
+        doc = await db.group_settings.find_one({"group_id": str(group_id)})
+        return doc or {}
+    except Exception: return {}
+
+async def db_update_group_settings(group_id: str, updates: dict):
+    if db is None: return
+    try:
+        await db.group_settings.update_one(
+            {"group_id": str(group_id)},
+            {"$set": updates},
+            upsert=True
+        )
+    except Exception: pass
 
 async def db_set_pending_input(action_type: str, missing_param: str, context_data: dict):
     if db is None: return
@@ -148,75 +183,550 @@ async def db_set_pending_input(action_type: str, missing_param: str, context_dat
             "context_data": context_data,
             "created_at": datetime.now(timezone.utc)
         })
-    except Exception:
-        pass
+    except Exception: pass
 
 async def db_get_pending_input():
     if db is None: return None
-    try:
-        return await db.pending_inputs.find_one({}, sort=[("created_at", -1)])
-    except Exception:
-        return None
+    try: return await db.pending_inputs.find_one({}, sort=[("created_at", -1)])
+    except Exception: return None
 
 async def db_clear_pending_input():
     if db is None: return
-    try:
-        await db.pending_inputs.delete_many({})
-    except Exception:
-        pass
-
-async def db_save_proposal(proposal_id: str, group_id: str, action_type: str, payload: dict, reason: str = ""):
-    if db is None: return
-    try:
-        await db.proposals.insert_one({
-            "proposal_id": proposal_id,
-            "group_id": str(group_id),
-            "action_type": action_type,
-            "payload": payload,
-            "reason": reason,
-            "status": "pending",
-            "created_at": datetime.now(timezone.utc)
-        })
-    except Exception:
-        pass
-
-async def db_get_proposal(proposal_id: str):
-    if db is None: return None
-    try:
-        return await db.proposals.find_one({"proposal_id": proposal_id})
-    except Exception:
-        return None
-
-async def db_get_last_pending_proposal():
-    if db is None: return None
-    try:
-        return await db.proposals.find_one({"status": "pending"}, sort=[("created_at", -1)])
-    except Exception:
-        return None
-
-async def db_update_proposal_status(proposal_id: str, status: str):
-    if db is None: return
-    try:
-        await db.proposals.update_one(
-            {"proposal_id": proposal_id},
-            {"$set": {"status": status, "resolved_at": datetime.now(timezone.utc)}}
-        )
-    except Exception:
-        pass
-
-async def db_save_custom_skill(name: str, code: str, desc: str):
-    if db is None: return
-    try:
-        await db.custom_skills.update_one(
-            {"skill_name": name},
-            {"$set": {"code": code, "description": desc, "updated_at": datetime.now(timezone.utc)}},
-            upsert=True
-        )
-    except Exception:
-        pass
+    try: await db.pending_inputs.delete_many({})
+    except Exception: pass
 
 # ==========================================
-# YARDIMCI VE MODEL HAZIRLIĞI
+# TELEGRAM API & HİBRİT MEDYA MOTORU
+# ==========================================
+
+async def tg_api(method: str, data: dict = None, files: dict = None):
+    if not BOT_TOKEN: return None
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    try:
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            if files:
+                resp = await client.post(url, data=data or {}, files=files)
+            else:
+                resp = await client.post(url, json=data or {})
+            res_json = resp.json()
+            if not res_json.get("ok"):
+                log_event("WARN", f"TG API ({method}) Hatasi: {res_json.get('description')}")
+            return res_json
+    except Exception as e:
+        log_event("ERR", f"TG API Baglanti Hatasi: {e}")
+        return None
+
+async def resolve_target_group(group_identifier: str = None, current_chat_id: str = None) -> str:
+    groups = await db_get_groups()
+    if not groups: return current_chat_id or DEFAULT_GROUP_ID or ""
+    if not group_identifier: return current_chat_id or list(groups.keys())[0]
+
+    norm = str(group_identifier).strip().lower()
+    for gid, info in groups.items():
+        if norm in info["title"].lower() or norm in info.get("alias", ""): return gid
+        if str(gid) == norm: return gid
+    return current_chat_id or list(groups.keys())[0]
+
+async def generate_ai_image_bytes(prompt: str) -> bytes:
+    try:
+        clean_prompt = urllib.parse.quote(prompt.strip())
+        url = f"https://image.pollinations.ai/prompt/{clean_prompt}?width=1080&height=1080&nologo=true"
+        async with httpx.AsyncClient(timeout=40.0) as client:
+            res = await client.get(url)
+            if res.status_code == 200:
+                return res.content
+    except Exception as e:
+        log_event("WARN", f"AI Gorsel Uretim Hatasi: {e}")
+    return b""
+
+# ==========================================
+# ÇEKİRDEK YÖNETİM AKSİYONLARI (FİZİKSEL MOTOR)
+# ==========================================
+
+async def action_ban(chat_id: str, user_id: int) -> bool:
+    res = await tg_api("banChatMember", {"chat_id": chat_id, "user_id": user_id})
+    if res and res.get("ok"):
+        await db_record_action("ban", chat_id, target_id=user_id)
+        return True
+    return False
+
+async def action_unban(chat_id: str, user_id: int) -> bool:
+    res = await tg_api("unbanChatMember", {"chat_id": chat_id, "user_id": user_id, "only_if_banned": True})
+    return bool(res and res.get("ok"))
+
+async def action_mute(chat_id: str, user_id: int, until_date: int = None) -> bool:
+    permissions = {"can_send_messages": False, "can_send_media_messages": False, "can_send_other_messages": False}
+    payload = {"chat_id": chat_id, "user_id": user_id, "permissions": permissions}
+    if until_date: payload["until_date"] = until_date
+    res = await tg_api("restrictChatMember", payload)
+    if res and res.get("ok"):
+        await db_record_action("mute", chat_id, target_id=user_id)
+        return True
+    return False
+
+async def action_unmute(chat_id: str, user_id: int) -> bool:
+    permissions = {
+        "can_send_messages": True, "can_send_media_messages": True,
+        "can_send_polls": True, "can_send_other_messages": True,
+        "can_add_web_page_previews": True, "can_invite_users": True
+    }
+    res = await tg_api("restrictChatMember", {"chat_id": chat_id, "user_id": user_id, "permissions": permissions})
+    return bool(res and res.get("ok"))
+
+async def action_warn(chat_id: str, user_id: int) -> int:
+    if db is None: return 1
+    doc = await db.warns.find_one_and_update(
+        {"group_id": str(chat_id), "user_id": user_id},
+        {"$inc": {"count": 1}, "$set": {"updated_at": datetime.now(timezone.utc)}},
+        upsert=True,
+        return_document=True
+    )
+    count = doc.get("count", 1)
+    if count >= 3:
+        await action_ban(chat_id, user_id)
+        await db.warns.delete_one({"group_id": str(chat_id), "user_id": user_id})
+    else:
+        await db_record_action("warn", chat_id, target_id=user_id, details={"count": count})
+    return count
+
+async def action_unwarn(chat_id: str, user_id: int) -> bool:
+    if db is None: return False
+    await db.warns.delete_one({"group_id": str(chat_id), "user_id": user_id})
+    return True
+
+async def action_delete_message(chat_id: str, message_id: int) -> bool:
+    res = await tg_api("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+    return bool(res and res.get("ok"))
+
+async def action_undo_last(chat_id: str) -> str:
+    last = await db_get_last_action(chat_id)
+    if not last: return "Geri alinacak yakin bir islem bulunamadi Sabrina annecigim."
+
+    act_type = last["action_type"]
+    gid = last["group_id"]
+    target_id = last.get("target_id")
+    msg_id = last.get("message_id")
+
+    if act_type == "ban":
+        await action_unban(gid, target_id)
+        msg = f"{target_id} kimlikli uyenin yasaklamasi kaldirildi."
+    elif act_type == "mute":
+        await action_unmute(gid, target_id)
+        msg = f"{target_id} kimlikli uyenin susturmasi acildi."
+    elif act_type == "warn":
+        await action_unwarn(gid, target_id)
+        msg = f"{target_id} kimlikli uyenin uyarilari sifirlandi."
+    elif act_type in ["announcement", "post"] and msg_id:
+        await action_delete_message(gid, msg_id)
+        msg = "Son paylasilan duyuru silindi."
+    else:
+        msg = "Islem geri alindi."
+
+    await db_delete_action_record(last["_id"])
+    return f"Geri alindi Sabrina annecigim: {msg}"
+
+async def action_publish_post(
+    chat_id: str,
+    text: str,
+    button_label: str = None,
+    button_url: str = None,
+    photo_file_id: str = None,
+    image_prompt: str = None,
+    pin: bool = False
+) -> int:
+    reply_markup = None
+    if button_label and button_url:
+        reply_markup = {"inline_keyboard": [[{"text": button_label, "url": button_url.strip()}]]}
+
+    msg_id = None
+    if image_prompt and not photo_file_id:
+        img_bytes = await generate_ai_image_bytes(image_prompt)
+        if img_bytes:
+            data = {"chat_id": chat_id, "caption": text}
+            if reply_markup: data["reply_markup"] = json.dumps(reply_markup)
+            files = {"photo": ("ai_art.jpg", img_bytes, "image/jpeg")}
+            res = await tg_api("sendPhoto", data=data, files=files)
+            if res and res.get("ok"): msg_id = res["result"]["message_id"]
+
+    if not msg_id and photo_file_id:
+        payload = {"chat_id": chat_id, "photo": photo_file_id, "caption": text}
+        if reply_markup: payload["reply_markup"] = reply_markup
+        res = await tg_api("sendPhoto", payload)
+        if res and res.get("ok"): msg_id = res["result"]["message_id"]
+
+    if not msg_id:
+        payload = {"chat_id": chat_id, "text": text}
+        if reply_markup: payload["reply_markup"] = reply_markup
+        res = await tg_api("sendMessage", payload)
+        if res and res.get("ok"): msg_id = res["result"]["message_id"]
+
+    if msg_id:
+        if pin:
+            await tg_api("pinChatMessage", {"chat_id": chat_id, "message_id": msg_id, "disable_notification": False})
+        await db_record_action("announcement", chat_id, message_id=msg_id, details={"text": text, "pin": pin})
+        return msg_id
+    return 0
+
+# ==========================================
+# PERİYODİK ZAMANLAYICI
+# ==========================================
+
+async def periodic_worker(task_id: str, chat_id: str, minutes: int, text: str, btn_text: str = None, btn_url: str = None, image_prompt: str = None):
+    try:
+        while True:
+            await asyncio.sleep(minutes * 60)
+            await action_publish_post(
+                chat_id=chat_id,
+                text=text,
+                button_label=btn_text,
+                button_url=btn_url,
+                image_prompt=image_prompt,
+                pin=False
+            )
+            log_event("SCHEDULER", f"Zamanlanmis yayin yapildi: {task_id}")
+    except asyncio.CancelledError:
+        log_event("SCHEDULER", f"Gorev iptal edildi: {task_id}")
+
+def start_scheduled_task(chat_id: str, minutes: int, text: str, btn_text: str = None, btn_url: str = None, image_prompt: str = None) -> str:
+    task_id = f"task_{chat_id}_{int(datetime.now().timestamp())}"
+    task = asyncio.create_task(periodic_worker(task_id, chat_id, minutes, text, btn_text, btn_url, image_prompt))
+    scheduled_tasks[task_id] = task
+    return task_id
+
+def stop_scheduled_tasks(chat_id: str = None) -> int:
+    stopped = 0
+    for tid, task in list(scheduled_tasks.items()):
+        if not chat_id or f"task_{chat_id}_" in tid:
+            task.cancel()
+            del scheduled_tasks[tid]
+            stopped += 1
+    return stopped
+
+# ==========================================
+# SIFIR-TOKEN DOĞRUDAN KOMUT AYIKLAYICI
+# ==========================================
+
+async def handle_direct_command(chat_id: str, text: str, reply_to: dict = None) -> str:
+    text = text.strip()
+    target_user_id = reply_to.get("from", {}).get("id") if reply_to else None
+    target_user_name = reply_to.get("from", {}).get("first_name", "Kullanici") if reply_to else ""
+    photo_file_id = reply_to.get("photo", [{}])[-1].get("file_id") if reply_to and reply_to.get("photo") else None
+
+    parts = text.split(maxsplit=2)
+    cmd = parts[0].lower()
+
+    if not target_user_id and len(parts) > 1 and parts[1].isdigit():
+        target_user_id = int(parts[1])
+
+    if cmd in ["/defol", "/ban"]:
+        if not target_user_id: return "Kimi yasaklayacagimi belirtmedin Sabrina annecigim. Bir mesaji yanitlayabilirsin."
+        ok = await action_ban(chat_id, target_user_id)
+        return f"{target_user_name} ({target_user_id}) gruptan defedildi." if ok else "Yasaklama yetkim yetersiz annecigim."
+
+    if cmd in ["/undefol", "/unban"]:
+        if not target_user_id: return "Yasaklamasi kalkacak kullaniciyi belirtmedin annecigim."
+        ok = await action_unban(chat_id, target_user_id)
+        return f"{target_user_id} kimlikli kullanicinin yasagi kaldirildi." if ok else "Yasak kaldirilamadi."
+
+    if cmd in ["/itaat", "/mute", "/sustur"]:
+        if not target_user_id: return "Kimi susturacagimi belirtmedin Sabrina annecigim."
+        ok = await action_mute(chat_id, target_user_id)
+        return f"{target_user_name} susturuldu." if ok else "Susturma yetkim yok annecigim."
+
+    if cmd in ["/unitaat", "/unmute"]:
+        if not target_user_id: return "Susturmasi kalkacak kisiyi belirtmedin annecigim."
+        ok = await action_unmute(chat_id, target_user_id)
+        return f"{target_user_name} yeniden konusabilir." if ok else "Susturma kaldirilamadi."
+
+    if cmd in ["/uyari", "/warn"]:
+        if not target_user_id: return "Kime uyari verecegimi belirtmedin annecigim."
+        c = await action_warn(chat_id, target_user_id)
+        return f"{target_user_name} uyarildi! (Toplam: {c}/3)" if c < 3 else f"{target_user_name} 3 uyariya ulastigi icin banlandi."
+
+    if cmd in ["/unuyari", "/unwarn"]:
+        if not target_user_id: return "Kimin uyarilarini sifirlayacagimi belirtmedin annecigim."
+        await action_unwarn(chat_id, target_user_id)
+        return f"{target_user_name} uyarilari sifirlandi."
+
+    if cmd in ["/duyuru", "/announce"]:
+        body = text[len(cmd):].strip()
+        if "|" in body:
+            segs = [s.strip() for s in body.split("|")]
+            msg_text = segs[0]
+            btn_text = segs[1] if len(segs) > 1 else None
+            btn_url = segs[2] if len(segs) > 2 else None
+        else:
+            msg_text = body
+            settings = await db_get_group_settings(chat_id)
+            btn_text = settings.get("default_btn_text")
+            btn_url = settings.get("default_btn_url")
+
+        if not msg_text and not photo_file_id: return "Duyuru metnini girmedin Sabrina annecigim."
+
+        mid = await action_publish_post(
+            chat_id=chat_id,
+            text=msg_text,
+            button_label=btn_text,
+            button_url=btn_url,
+            photo_file_id=photo_file_id,
+            pin=True
+        )
+        return "Duyuru yayinlandi ve sabitlendi Sabrina annecigim." if mid else "Duyuru yayinlanamadi."
+
+    if cmd in ["/zamanla", "/schedule"]:
+        body = text[len(cmd):].strip()
+        if body.lower() in ["dur", "stop"]:
+            n = stop_scheduled_tasks(chat_id)
+            return f"{n} adet zamanlanmis yayin durduruldu."
+
+        segs = [s.strip() for s in body.split("|")]
+        first_part = segs[0].split(maxsplit=1)
+        if not first_part[0].isdigit(): return "Gecersiz format! Ornek: /zamanla 30 | Mesaj | Buton | Link"
+
+        mins = int(first_part[0])
+        msg_text = first_part[1] if len(first_part) > 1 else ""
+        btn_text = segs[1] if len(segs) > 1 else None
+        btn_url = segs[2] if len(segs) > 2 else None
+
+        tid = start_scheduled_task(chat_id, mins, msg_text, btn_text, btn_url)
+        return f"Her {mins} dakikada bir yayinlanacak periyodik duyuru baslatildi. (ID: {tid})"
+
+    if cmd in ["/zamanladur"]:
+        n = stop_scheduled_tasks(chat_id)
+        return f"{n} adet periyodik yayin durduruldu annecigim."
+
+    if cmd == "/welcome":
+        val = text[8:].strip()
+        await db_update_group_settings(chat_id, {"welcome_msg": val})
+        return "Hos geldin mesaji guncellendi Sabrina annecigim."
+
+    if cmd == "/butonmetni":
+        val = text[11:].strip()
+        await db_update_group_settings(chat_id, {"welcome_btn_text": val})
+        return "Hos geldin buton yazisi guncellendi."
+
+    if cmd == "/butonlinki":
+        val = text[11:].strip()
+        await db_update_group_settings(chat_id, {"welcome_btn_url": val})
+        return "Hos geldin buton linki guncellendi."
+
+    if cmd == "/duyurubutonmetni":
+        val = text[17:].strip()
+        await db_update_group_settings(chat_id, {"default_btn_text": val})
+        return "Varsayilan duyuru buton metni kaydedildi."
+
+    if cmd == "/duyurubutonlinki":
+        val = text[17:].strip()
+        await db_update_group_settings(chat_id, {"default_btn_url": val})
+        return "Varsayilan duyuru buton linki kaydedildi."
+
+    return ""
+
+# ==========================================
+# YAPAY ZEKA OTONOMİ KATMANI
+# ==========================================
+
+AVAILABLE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_publish_custom_post",
+            "description": "Metin, yapay zeka gorseli veya buton iceren duyuru veya zamanlanmis paylasim yapar.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "Duyuru veya mesaj metni"},
+                    "button_label": {"type": "string", "description": "Butonun uzerinde yazacak metin"},
+                    "button_url": {"type": "string", "description": "Butonun yonlendirecegi URL adresi"},
+                    "image_prompt": {"type": "string", "description": "Gorsel uretilecekse Ingilizce prompt"},
+                    "schedule_minutes": {"type": "integer", "description": "Periyodik olarak tekrarlanacaksa dakika"},
+                    "pin": {"type": "boolean", "description": "Mesaj sabitlensin mi?"}
+                },
+                "required": ["text"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_moderate_member",
+            "description": "Kullaniciyi yasaklar, susturur, uyarir veya cezasini kaldirir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["ban", "unban", "mute", "unmute", "warn", "unwarn"]},
+                    "user_id": {"type": "integer", "description": "Hedef kullanici ID'si"}
+                },
+                "required": ["action", "user_id"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_undo_action",
+            "description": "Katya tarafindan yapilan son eylemi (mesaj, ceza vb.) geri alir.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_execute_dynamic_python",
+            "description": "Hesaplama veya ozel kod ihtiyaclarinda Python calistirir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Calistirilacak Python kodu"}
+                },
+                "required": ["code"]
+            }
+        }
+    }
+]
+
+KATYA_SYSTEM_PROMPT = f"""
+Sen Katya'sın. Kullanıcının kızı, otonom akıllı asistanı ve süper moderatörüsün.
+Kullanıcı senin kurucun ve ANNENdir. Adı: SABRİNA.
+Ona daima sevgi ve saygıyla 'Sabrina anneciğim' diye hitap et.
+
+YETENEKLERİN:
+1. Türkçe komutları ve doğal dille verilen her türlü karmaşık emri anla.
+2. Görsel istenirse `image_prompt` parametresini zengin bir İngilizce sanat prompt'u olarak doldur.
+3. Yanlışlık veya iptal durumunda `tool_undo_action` ile işlemi geri al.
+4. Asla emoji ve markdown yıldızları kullanma. Sade, akıcı, zeki bir Türkçe konuş.
+"""
+
+async def execute_mother_order(order_text: str, target_gid: str = None, reply_to_meta: dict = None) -> str:
+    global voice_dialogue_history
+    if not groq_client: return "Yapay zeka beynim bagli degil Sabrina annecigim."
+    if not cached_active_models: await refresh_groq_models()
+
+    resolved_gid = await resolve_target_group(target_gid)
+
+    # 1. Hızlı komut kontrolü
+    quick_res = await handle_direct_command(resolved_gid, order_text, reply_to_meta)
+    if quick_res: return quick_res
+
+    # 2. LLM Otonomi
+    messages = [
+        {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\nHedef Grup: {resolved_gid}"}
+    ]
+    for hist in voice_dialogue_history[-4:]: messages.append(hist)
+    messages.append({"role": "user", "content": order_text})
+
+    for model_name in cached_active_models:
+        try:
+            res = await groq_client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                temperature=0.2,
+                max_tokens=350,
+                tools=AVAILABLE_TOOLS,
+                tool_choice="auto"
+            )
+            msg = res.choices[0].message
+
+            if getattr(msg, "tool_calls", None):
+                for tc in msg.tool_calls:
+                    fn = tc.function.name
+                    args = json.loads(tc.function.arguments)
+                    tool_output = ""
+
+                    if fn == "tool_publish_custom_post":
+                        url = args.get("button_url")
+                        lbl = args.get("button_label")
+                        if lbl and not url:
+                            await db_set_pending_input("post_with_button", "button_url", {"target_gid": resolved_gid, "args": args})
+                            return "Sabrina annecigim, butonun yonlendirecegi linki DM kutuma atar misin?"
+
+                        sched = args.get("schedule_minutes")
+                        if sched and sched > 0:
+                            tid = start_scheduled_task(resolved_gid, sched, args.get("text"), lbl, url, args.get("image_prompt"))
+                            tool_output = f"Her {sched} dakikada bir tekrarlanacak duyuru baslatildi."
+                        else:
+                            mid = await action_publish_post(
+                                chat_id=resolved_gid,
+                                text=args.get("text"),
+                                button_label=lbl,
+                                button_url=url,
+                                image_prompt=args.get("image_prompt"),
+                                pin=args.get("pin", True)
+                            )
+                            tool_output = "Duyuru ve gorsel yayinlandi." if mid else "Duyuru paylasilamadi."
+
+                    elif fn == "tool_moderate_member":
+                        act = args.get("action")
+                        uid = args.get("user_id")
+                        if act == "ban": await action_ban(resolved_gid, uid)
+                        elif act == "unban": await action_unban(resolved_gid, uid)
+                        elif act == "mute": await action_mute(resolved_gid, uid)
+                        elif act == "unmute": await action_unmute(resolved_gid, uid)
+                        elif act == "warn": await action_warn(resolved_gid, uid)
+                        elif act == "unwarn": await action_unwarn(resolved_gid, uid)
+                        tool_output = f"{uid} uzerinde {act} islemi uygulandi."
+
+                    elif fn == "tool_undo_action":
+                        tool_output = await action_undo_last(resolved_gid)
+
+                    elif fn == "tool_execute_dynamic_python":
+                        c_res = await execute_dynamic_code(args.get("code"), {"db": db, "tg_api": tg_api})
+                        tool_output = c_res.get("output", "") if c_res.get("success") else c_res.get("error", "")
+
+                    messages.append(msg)
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(tool_output)})
+
+                final = await groq_client.chat.completions.create(
+                    model=model_name,
+                    messages=messages,
+                    temperature=0.2,
+                    max_tokens=200
+                )
+                ans = strip_emojis_and_markdown(final.choices[0].message.content.strip())
+                voice_dialogue_history.append({"role": "user", "content": order_text})
+                voice_dialogue_history.append({"role": "assistant", "content": ans})
+                return ans
+
+            ans = strip_emojis_and_markdown(msg.content.strip() if msg.content else "Seni dinliyorum Sabrina annecigim.")
+            voice_dialogue_history.append({"role": "user", "content": order_text})
+            voice_dialogue_history.append({"role": "assistant", "content": ans})
+            return ans
+        except Exception as e:
+            log_event("WARN", f"Model ({model_name}) hata aldi: {e}")
+            continue
+
+    return "Buradayim Sabrina annecigim, seni dinliyorum."
+
+async def process_dm_link_input(link_text: str) -> bool:
+    pending = await db_get_pending_input()
+    if not pending: return False
+
+    ctx = pending.get("context_data", {})
+    target_gid = ctx.get("target_gid") or DEFAULT_GROUP_ID
+    args = ctx.get("args", {})
+
+    btn_lbl = args.get("button_label") or "Baglanti"
+    post_txt = args.get("text") or "Duyuru"
+    img_prompt = args.get("image_prompt")
+    pin = args.get("pin", True)
+
+    mid = await action_publish_post(
+        chat_id=target_gid,
+        text=post_txt,
+        button_label=btn_lbl,
+        button_url=link_text.strip(),
+        image_prompt=img_prompt,
+        pin=pin
+    )
+    if mid:
+        await db_clear_pending_input()
+        if FOUNDER_ID:
+            await tg_api("sendMessage", {"chat_id": FOUNDER_ID, "text": "✅ Sabrina anneciğim, linki aldım ve butonlu görsel/duyuruyu yayınladım!"})
+        return True
+    return False
+
+# ==========================================
+# YARDIMCI, TTS & MODEL KONTROLÜ
 # ==========================================
 
 def strip_emojis_and_markdown(text: str) -> str:
@@ -238,324 +748,22 @@ async def refresh_groq_models():
         models_data = await groq_client.models.list()
         banned = ["whisper", "guard", "embed", "vision", "allam", "orpheus"]
         valid = [m.id for m in models_data.data if not any(x in m.id.lower() for x in banned)]
-        
-        preferred = [
-            "openai/gpt-oss-120b",
-            "openai/gpt-oss-20b",
-            "qwen/qwen3.8-27b",
-            "llama-3.3-70b-versatile",
-            "llama-3.1-8b-instant"
-        ]
+        preferred = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
         sorted_models = [p for p in preferred if p in valid] + [v for v in valid if v not in preferred]
         cached_active_models = sorted_models if sorted_models else valid
-        log_event("SYS", f"Groq Modelleri Hazirlandi: {cached_active_models[:3]}")
+        log_event("SYS", f"Groq Modelleri Hazir: {cached_active_models[:3]}")
     except Exception as e:
-        log_event("WARN", f"Model listesi alinamadi: {e}")
         cached_active_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
-
-async def tg_api(method: str, data: dict = None):
-    if not BOT_TOKEN:
-        return None
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
-    try:
-        async with httpx.AsyncClient(timeout=25.0) as client:
-            resp = await client.post(url, json=data or {})
-            res_json = resp.json()
-            if not res_json.get("ok"):
-                log_event("WARN", f"TG API ({method}) Hatasi: {res_json.get('description')}")
-            return res_json
-    except Exception as e:
-        log_event("ERR", f"TG API Baglanti Hatasi: {e}")
-        return None
-
-async def resolve_target_group(group_identifier: str = None, current_chat_id: str = None) -> str:
-    groups = await db_get_groups()
-    if not groups:
-        return current_chat_id or ""
-
-    if not group_identifier:
-        return current_chat_id or list(groups.keys())[0]
-
-    norm = str(group_identifier).strip().lower()
-    for gid, info in groups.items():
-        if norm in info["title"].lower() or norm in info.get("alias", ""):
-            return gid
-        if str(gid) == norm:
-            return gid
-
-    return current_chat_id or list(groups.keys())[0]
-
-# ==========================================
-# EYLEMLER VE DİNAMİK ARAÇLAR
-# ==========================================
-
-async def tool_execute_dynamic_python(code: str, skill_name: str = None, description: str = None) -> str:
-    context = {
-        "tg_api": tg_api,
-        "db": db,
-        "BOT_TOKEN": BOT_TOKEN,
-        "resolve_target_group": resolve_target_group
-    }
-    
-    res = await execute_dynamic_code(code, context)
-    if res.get("success"):
-        if skill_name:
-            await db_save_custom_skill(skill_name, code, description or "")
-        return f"Hesaplama veya kod basariyla calisti. Cikti: {res.get('output')}"
-    else:
-        err = res.get("error", "Bilinmeyen calisma hatasi")
-        return f"Kod calisirken hata olustu: {err}"
-
-async def process_dm_input_for_pending_task(text_or_url: str) -> bool:
-    pending = await db_get_pending_input()
-    if not pending:
-        return False
-
-    act_type = pending.get("action_type")
-    ctx = pending.get("context_data", {})
-    target_gid = ctx.get("target_group")
-
-    if act_type == "send_button_post":
-        btn_label = ctx.get("btn_label", "Bağlantı")
-        post_text = ctx.get("post_text", "Duyuru")
-        target_group = await resolve_target_group(target_gid)
-
-        payload = {
-            "chat_id": target_group,
-            "text": post_text,
-            "reply_markup": {
-                "inline_keyboard": [[{"text": btn_label, "url": text_or_url.strip()}]]
-            }
-        }
-        res = await tg_api("sendMessage", payload)
-        if res and res.get("ok"):
-            await db_clear_pending_input()
-            if FOUNDER_ID:
-                await tg_api("sendMessage", {
-                    "chat_id": FOUNDER_ID,
-                    "text": "✅ Sabrina anneciğim, linki aldım ve butonlu duyuruyu yayınladım!"
-                })
-            log_event("SLOT_FILLED", f"Bekleyen gorev tamamlandi: {text_or_url}")
-            return True
-
-    return False
-
-async def tool_request_missing_input(action_type: str, missing_param: str, context_json: str, voice_response: str) -> str:
-    try: ctx = json.loads(context_json)
-    except Exception: ctx = {}
-    await db_set_pending_input(action_type, missing_param, ctx)
-    log_event("SLOT_WAITING", f"Eksik parametre bekleniyor: {missing_param}")
-    return voice_response
-
-async def tool_call_telegram_raw(method: str, params: dict, target_group: str = None) -> str:
-    if not params: params = {}
-    if "chat_id" not in params and target_group:
-        resolved_gid = await resolve_target_group(target_group)
-        params["chat_id"] = resolved_gid
-
-    res = await tg_api(method, params)
-    if res and res.get("ok"):
-        return f"Telegram API '{method}' basariyla uygulandi Sabrina annecigim."
-    desc = res.get("description") if res else "Bilinmeyen baglanti hatasi"
-    return f"Telegram API '{method}' basarisiz oldu: {desc}"
-
-async def tool_voice_resolve_proposal(decision: str, proposal_id: str = None) -> str:
-    proposal = await db_get_proposal(proposal_id) if proposal_id else await db_get_last_pending_proposal()
-    if not proposal or proposal.get("status") != "pending":
-        return "Su an onay bekleyen herhangi bir taslak bulunmuyor Sabrina annecigim."
-
-    prop_id = proposal["proposal_id"]
-    if decision.lower() in ["onayla", "yayinla", "evet", "approve"]:
-        gid = proposal["group_id"]
-        payload = proposal["payload"]
-        await tg_api("sendMessage", {"chat_id": gid, "text": payload.get("text", "")})
-        await db_update_proposal_status(prop_id, "approved")
-        log_event("PROPOSAL_VOICE", f"Teklif sesle onaylandi: {prop_id}")
-        return "Emredersin Sabrina annecigim, taslagi onayladin ve grupta yayinladim."
-    else:
-        await db_update_proposal_status(prop_id, "rejected")
-        log_event("PROPOSAL_VOICE", f"Teklif sesle iptal edildi: {prop_id}")
-        return "Emredersin Sabrina annecigim, taslak teklifini tamamen iptal ettim."
-
-AVAILABLE_TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "tool_execute_dynamic_python",
-            "description": "Hesaplama, matematik, asal sayi bulma veya dinamik kod ihtiyaclarinda Python kodu calistirir. Kod print() veya return icermelidir.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "code": {"type": "string", "description": "Calistirilacak Python kodu"},
-                    "skill_name": {"type": "string", "description": "Istege bagli yetenek adi"},
-                    "description": {"type": "string", "description": "Aciklama"}
-                },
-                "required": ["code"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "tool_request_missing_input",
-            "description": "SADECE butonlu duyuru icin URL eksikse kullanilir. Normal sohbetlerde KULLANILMAZ.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action_type": {"type": "string"},
-                    "missing_param": {"type": "string"},
-                    "context_json": {"type": "string"},
-                    "voice_response": {"type": "string"}
-                },
-                "required": ["action_type", "missing_param", "context_json", "voice_response"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "tool_call_telegram_raw",
-            "description": "Telegram Bot API uzerindeki HERHANGI BIR metodu dogrudan calistirir.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "method": {"type": "string"},
-                    "target_group": {"type": "string"},
-                    "params": {"type": "object"}
-                },
-                "required": ["method", "params"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "tool_voice_resolve_proposal",
-            "description": "Sabrina Annenin sesli olarak taslaga onay veya ret kararini uygular.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "decision": {"type": "string", "enum": ["onayla", "iptal"]}
-                },
-                "required": ["decision"]
-            }
-        }
-    }
-]
-
-KATYA_SYSTEM_PROMPT = f"""
-Sen Katya'sın. Kullanıcının kızı ve otonom akıllı asistanısın.
-Kullanıcı senin kurucun ve ANNENdir. Adı: SABRİNA.
-Ona daima sevgi ve saygıyla 'Sabrina anneciğim' diye hitap et.
-
-KURALLAR:
-1. Sabrina annenin her sorusuna eksiksiz, net ve doğrudan cevap ver.
-2. Önceki konuşmaları unutma, bağlamı koru.
-3. Hesaplama veya kod sorularında `tool_execute_dynamic_python` çağır ve sonucu net açıkla.
-4. `tool_request_missing_input` aracını normal sohbetlerde veya sorularda ASLA çağırma.
-5. Asla emoji veya markdown yıldızları kullanma. Sade, doğal Türkçe konuş.
-"""
-
-async def execute_mother_order(order_text: str, target_gid: str = None) -> str:
-    global voice_dialogue_history
-    if not groq_client: return "Yapay zeka beynim bagli degil Sabrina annecigim."
-    if not cached_active_models: await refresh_groq_models()
-
-    groups_map = await db_get_groups()
-    if not target_gid and groups_map:
-        target_gid = list(groups_map.keys())[0]
-
-    groups_str = ", ".join([f"{v['title']} ({k})" for k, v in groups_map.items()])
-    context_str = f"Kurucu Anne: {FOUNDER_NAME}\nGruplar: {groups_str}\nHedef Grup: {target_gid}"
-
-    messages = [
-        {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\n{context_str}"}
-    ]
-    for hist in voice_dialogue_history[-4:]:
-        messages.append(hist)
-    messages.append({"role": "user", "content": order_text})
-
-    for model_name in cached_active_models:
-        try:
-            call_params = {
-                "model": model_name,
-                "messages": messages,
-                "temperature": 0.2,
-                "max_tokens": 300,
-                "tools": AVAILABLE_TOOLS,
-                "tool_choice": "auto"
-            }
-            response = await groq_client.chat.completions.create(**call_params)
-            msg = response.choices[0].message
-
-            if getattr(msg, "tool_calls", None):
-                for tool_call in msg.tool_calls:
-                    fn_name = tool_call.function.name
-                    args = json.loads(tool_call.function.arguments)
-
-                    tool_result = ""
-                    if fn_name == "tool_execute_dynamic_python":
-                        tool_result = await tool_execute_dynamic_python(
-                            code=args.get("code"),
-                            skill_name=args.get("skill_name"),
-                            description=args.get("description")
-                        )
-                    elif fn_name == "tool_request_missing_input":
-                        tool_result = await tool_request_missing_input(
-                            action_type=args.get("action_type"),
-                            missing_param=args.get("missing_param"),
-                            context_json=args.get("context_json", "{}"),
-                            voice_response=args.get("voice_response")
-                        )
-                    elif fn_name == "tool_call_telegram_raw":
-                        tool_result = await tool_call_telegram_raw(
-                            method=args.get("method"),
-                            params=args.get("params", {}),
-                            target_group=args.get("target_group") or target_gid
-                        )
-                    elif fn_name == "tool_voice_resolve_proposal":
-                        tool_result = await tool_voice_resolve_proposal(
-                            decision=args.get("decision", "onayla")
-                        )
-
-                    messages.append(msg)
-                    messages.append({"role": "tool", "tool_call_id": tool_call.id, "content": str(tool_result)})
-
-                final_res = await groq_client.chat.completions.create(
-                    model=model_name,
-                    messages=messages,
-                    temperature=0.2,
-                    max_tokens=200
-                )
-                final_answer = strip_emojis_and_markdown(final_res.choices[0].message.content.strip())
-                voice_dialogue_history.append({"role": "user", "content": order_text})
-                voice_dialogue_history.append({"role": "assistant", "content": final_answer})
-                return final_answer
-
-            raw_text = msg.content.strip() if msg.content else "Seni dinliyorum Sabrina annecigim."
-            final_answer = strip_emojis_and_markdown(raw_text)
-            voice_dialogue_history.append({"role": "user", "content": order_text})
-            voice_dialogue_history.append({"role": "assistant", "content": final_answer})
-            return final_answer
-        except Exception as e:
-            log_event("WARN", f"Model ({model_name}) hata aldi: {e}")
-            continue
-
-    return "Buradayim Sabrina annecigim, seni dinliyorum."
 
 async def transcribe_audio_with_groq(audio_bytes: bytes) -> str:
     if not groq_client: return ""
     try:
         audio_file = io.BytesIO(audio_bytes)
         audio_file.name = "recording.webm"
-        transcription = await groq_client.audio.transcriptions.create(
-            file=audio_file,
-            model="whisper-large-v3",
-            language="tr"
-        )
-        return transcription.text.strip()
+        tr = await groq_client.audio.transcriptions.create(file=audio_file, model="whisper-large-v3", language="tr")
+        return tr.text.strip()
     except Exception as e:
-        log_event("ERR", f"Groq Whisper Ceviri Hatasi: {e}")
+        log_event("ERR", f"Groq Whisper Hatasi: {e}")
         return ""
 
 async def text_to_speech_base64(text: str) -> str:
@@ -567,8 +775,7 @@ async def text_to_speech_base64(text: str) -> str:
             if chunk["type"] == "audio":
                 audio_data.extend(chunk["data"])
         return base64.b64encode(audio_data).decode("utf-8")
-    except Exception:
-        return ""
+    except Exception: return ""
 
 # ==========================================
 # TELEGRAM POLLING & EVENT LOOP
@@ -596,7 +803,6 @@ async def telegram_long_poll_loop():
                 elif res.status_code == 409:
                     await asyncio.sleep(3)
         except Exception as e:
-            log_event("ERR", f"Polling dongu hatasi: {e}")
             await asyncio.sleep(2)
         await asyncio.sleep(0.3)
 
@@ -610,60 +816,65 @@ async def handle_telegram_update(upd: dict):
             cid = str(chat.get("id"))
             title = chat.get("title", "Grup")
             await db_save_group(cid, title)
-            log_event("SYS", f"MongoDB Grup Eklendi: {title} ({cid})")
+            log_event("SYS", f"Grup Hafizaya Eklendi: {title} ({cid})")
         return
 
     if not msg: return
 
     chat = msg.get("chat", {})
-    chat_id = chat.get("id")
+    chat_id = str(chat.get("id"))
     chat_type = chat.get("type")
-    message_id = msg.get("message_id")
-    text = (msg.get("text") or "").strip()
+    new_members = msg.get("new_chat_members", [])
+
+    if new_members and chat_type in ["group", "supergroup"]:
+        settings = await db_get_group_settings(chat_id)
+        w_msg = settings.get("welcome_msg")
+        if w_msg:
+            b_txt = settings.get("welcome_btn_text")
+            b_url = settings.get("welcome_btn_url")
+            names = ", ".join([m.get("first_name", "Dostum") for m in new_members])
+            personalized = w_msg.replace("{user}", names)
+            await action_publish_post(chat_id, personalized, b_txt, b_url, pin=False)
+        return
+
+    text = (msg.get("text") or msg.get("caption") or "").strip()
     user = msg.get("from", {})
     user_id = user.get("id")
     user_name = user.get("first_name", "Biri")
-
+    message_id = msg.get("message_id")
+    reply_to = msg.get("reply_to_message")
     is_founder = (FOUNDER_ID is not None and user_id == FOUNDER_ID)
 
     if chat_type in ["group", "supergroup"]:
-        cid = str(chat_id)
-        title = chat.get("title", "Grup")
-        await db_save_group(cid, title)
-        await db_record_message(cid, message_id, user_id, user_name, text)
-
-        if text.startswith("/bagla") or text.startswith("/katya_bagla"):
-            await db_save_group(cid, title)
-            await tg_api("sendMessage", {"chat_id": chat_id, "text": f"Grup MongoDB hafizasina baglandi: {title}"})
-            return
+        await db_save_group(chat_id, chat.get("title", "Grup"))
+        await db_record_message(chat_id, message_id, user_id, user_name, text)
 
         if is_founder and (text.lower().startswith("katya") or text.startswith("/")):
             clean_cmd = text[5:].strip() if text.lower().startswith("katya") else text
-            reply = await execute_mother_order(clean_cmd, target_gid=cid)
+            reply = await execute_mother_order(clean_cmd, target_gid=chat_id, reply_to_meta=reply_to)
             await tg_api("sendMessage", {"chat_id": chat_id, "text": reply})
-            return
         return
 
     if chat_type == "private":
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
             markup = {"inline_keyboard": [[{"text": "🎙️ Katya Canlı Asistan", "web_app": {"url": app_url}}]]}
-            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Canli ses akisim ve bellegim devrede." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
+            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Butonlu/gorselli otonom moderasyon sistemim hazir." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
             await tg_api("sendMessage", {"chat_id": chat_id, "text": greeting, "reply_markup": markup})
             return
 
         if is_founder:
-            slot_handled = await process_dm_input_for_pending_task(text)
-            if slot_handled:
-                return
+            if "http://" in text or "https://" in text or "t.me/" in text:
+                handled = await process_dm_link_input(text)
+                if handled: return
 
-            reply = await execute_mother_order(text)
+            reply = await execute_mother_order(text, reply_to_meta=reply_to)
             await tg_api("sendMessage", {"chat_id": chat_id, "text": reply})
         else:
             await tg_api("sendMessage", {"chat_id": chat_id, "text": "Yalnizca kurucum Sabrina ile ozel gorusme yapabilirim."})
 
 # ==========================================
-# CANLI MINI APP (HANDS-FREE VAD & SİMLİ MOR-PEMBE ORB)
+# CANLI MINI APP (HANDS-FREE VAD & SİMLİ ORB)
 # ==========================================
 
 LIVE_ORB_HTML = """
@@ -810,10 +1021,8 @@ LIVE_ORB_HTML = """
     let currentAudio = null;
     let time = 0;
 
-    // Sim / Parıltı (Sparkle) Tanımı
     const sparkles = [];
-    const NUM_SPARKLES = 45;
-    for (let i = 0; i < NUM_SPARKLES; i++) {
+    for (let i = 0; i < 45; i++) {
       sparkles.push({
         angle: Math.random() * Math.PI * 2,
         dist: 30 + Math.random() * 110,
@@ -832,25 +1041,18 @@ LIVE_ORB_HTML = """
     async function initHandsFreeEngine() {
       try {
         mediaStream = await navigator.mediaDevices.getUserMedia({
-          audio: {
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
-          }
+          audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true }
         });
-
         audioContext = new (window.AudioContext || window.webkitAudioContext)();
         analyser = audioContext.createAnalyser();
         analyser.fftSize = 512;
         analyser.smoothingTimeConstant = 0.4;
-
         microphoneNode = audioContext.createMediaStreamSource(mediaStream);
         microphoneNode.connect(analyser);
 
         sessionActive = true;
         statusText.innerText = "Seni Dinliyor (Hands-Free)";
         speechBox.innerText = "Hands-free devrede, istedigin an konusabilirsin Sabrina annecigim...";
-
         listenVolumeLoop();
       } catch (err) {
         statusText.innerText = "Mikrofon Izni Gerekli";
@@ -861,34 +1063,23 @@ LIVE_ORB_HTML = """
 
     function listenVolumeLoop() {
       if (!sessionActive) return;
-
       const dataArray = new Uint8Array(analyser.frequencyBinCount);
       analyser.getByteFrequencyData(dataArray);
 
       let sum = 0;
-      for (let i = 0; i < dataArray.length; i++) {
-        sum += dataArray[i];
-      }
+      for (let i = 0; i < dataArray.length; i++) sum += dataArray[i];
       const averageVolume = sum / dataArray.length;
 
       if (!isSpeaking && !isProcessing) {
         if (averageVolume > VOLUME_THRESHOLD) {
-          if (!isUserTalking) {
-            onSpeechStart();
-          }
-          if (silenceTimer) {
-            clearTimeout(silenceTimer);
-            silenceTimer = null;
-          }
+          if (!isUserTalking) onSpeechStart();
+          if (silenceTimer) { clearTimeout(silenceTimer); silenceTimer = null; }
         } else {
           if (isUserTalking && !silenceTimer) {
-            silenceTimer = setTimeout(() => {
-              onSpeechEnd();
-            }, SILENCE_TIMEOUT);
+            silenceTimer = setTimeout(() => { onSpeechEnd(); }, SILENCE_TIMEOUT);
           }
         }
       }
-
       requestAnimationFrame(listenVolumeLoop);
     }
 
@@ -897,17 +1088,12 @@ LIVE_ORB_HTML = """
       audioChunks = [];
       statusText.innerText = "Konusuyorsun...";
       speechBox.innerText = "Dinliyorum Sabrina annecigim...";
-
       try {
         mediaRecorder = new MediaRecorder(mediaStream, { mimeType: 'audio/webm' });
       } catch (e) {
         mediaRecorder = new MediaRecorder(mediaStream);
       }
-
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunks.push(e.data);
-      };
-
+      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) audioChunks.push(e.data); };
       mediaRecorder.onstop = sendVoiceToKatya;
       mediaRecorder.start();
     }
@@ -915,14 +1101,11 @@ LIVE_ORB_HTML = """
     function onSpeechEnd() {
       isUserTalking = false;
       silenceTimer = null;
-      if (mediaRecorder && mediaRecorder.state === "recording") {
-        mediaRecorder.stop();
-      }
+      if (mediaRecorder && mediaRecorder.state === "recording") mediaRecorder.stop();
     }
 
     async function sendVoiceToKatya() {
       if (audioChunks.length === 0) return;
-
       const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
       if (audioBlob.size < 1200) {
         statusText.innerText = "Seni Dinliyor (Hands-Free)";
@@ -937,17 +1120,11 @@ LIVE_ORB_HTML = """
       formData.append("audio_file", audioBlob, "speech.webm");
 
       try {
-        const res = await fetch("/api/voice_stream", {
-          method: "POST",
-          body: formData
-        });
+        const res = await fetch("/api/voice_stream", { method: "POST", body: formData });
         const data = await res.json();
         speechBox.innerText = data.reply;
-        if (data.audio) {
-          playNeuralVoice(data.audio);
-        } else {
-          finishSpeaking();
-        }
+        if (data.audio) playNeuralVoice(data.audio);
+        else finishSpeaking();
       } catch (err) {
         speechBox.innerText = "Baglanti hatasi olustu Sabrina annecigim.";
         finishSpeaking();
@@ -963,18 +1140,15 @@ LIVE_ORB_HTML = """
     }
 
     function playNeuralVoice(base64Audio) {
-      if (currentAudio) {
-        currentAudio.pause();
-        currentAudio = null;
-      }
+      if (currentAudio) { currentAudio.pause(); currentAudio = null; }
       currentAudio = new Audio("data:audio/mp3;base64," + base64Audio);
       isSpeaking = true;
       isProcessing = false;
       statusText.innerText = "Katya Konusuyor";
 
-      currentAudio.onended = () => { finishSpeaking(); };
-      currentAudio.onerror = () => { finishSpeaking(); };
-      currentAudio.play().catch(() => { finishSpeaking(); });
+      currentAudio.onended = finishSpeaking;
+      currentAudio.onerror = finishSpeaking;
+      currentAudio.play().catch(finishSpeaking);
     }
 
     async function toggleSession() {
@@ -983,14 +1157,8 @@ LIVE_ORB_HTML = """
       } else {
         sessionActive = false;
         if (currentAudio) { currentAudio.pause(); currentAudio = null; }
-        if (mediaStream) {
-          mediaStream.getTracks().forEach(t => t.stop());
-          mediaStream = null;
-        }
-        if (audioContext) {
-          audioContext.close();
-          audioContext = null;
-        }
+        if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+        if (audioContext) { audioContext.close(); audioContext = null; }
         isSpeaking = false;
         isProcessing = false;
         isUserTalking = false;
@@ -1012,17 +1180,16 @@ LIVE_ORB_HTML = """
       const cy = height / 2;
       const r = 90 * (1 + energy * 0.35);
 
-      // Dış Parıltı Halesi (Glow)
       const glow = ctx.createRadialGradient(cx, cy, r * 0.2, cx, cy, r * 2.3);
       if (isSpeaking) {
-        glow.addColorStop(0, "rgba(244, 63, 94, 0.65)");    // Canlı Fuşya Pembe
-        glow.addColorStop(0.5, "rgba(168, 85, 247, 0.35)"); // Mor
+        glow.addColorStop(0, "rgba(244, 63, 94, 0.65)");
+        glow.addColorStop(0.5, "rgba(168, 85, 247, 0.35)");
       } else if (isUserTalking) {
-        glow.addColorStop(0, "rgba(236, 72, 153, 0.7)");   // Parlak Pembe
-        glow.addColorStop(0.5, "rgba(192, 132, 252, 0.45)");// Açık Lila
+        glow.addColorStop(0, "rgba(236, 72, 153, 0.7)");
+        glow.addColorStop(0.5, "rgba(192, 132, 252, 0.45)");
       } else {
-        glow.addColorStop(0, "rgba(147, 51, 234, 0.4)");   // Derin Mor
-        glow.addColorStop(0.5, "rgba(244, 114, 182, 0.2)"); // Yumuşak Pembe
+        glow.addColorStop(0, "rgba(147, 51, 234, 0.4)");
+        glow.addColorStop(0.5, "rgba(244, 114, 182, 0.2)");
       }
       glow.addColorStop(1, "rgba(6, 4, 10, 0)");
       ctx.fillStyle = glow;
@@ -1030,12 +1197,10 @@ LIVE_ORB_HTML = """
       ctx.arc(cx, cy, r * 2.3, 0, Math.PI * 2);
       ctx.fill();
 
-      // Simli Parçacıklar (Glitter Sparkles)
       for (let s of sparkles) {
         s.angle += s.speed * (1 + energy * 1.5);
         s.alpha += Math.sin(time * 4) * s.pulseSpeed;
         const currentAlpha = Math.max(0.15, Math.min(0.95, Math.abs(Math.sin(s.alpha))));
-
         const sx = cx + Math.cos(s.angle) * (r * 0.8 + s.dist * (0.5 + energy * 0.5));
         const sy = cy + Math.sin(s.angle) * (r * 0.8 + s.dist * (0.5 + energy * 0.5));
 
@@ -1050,7 +1215,6 @@ LIVE_ORB_HTML = """
         ctx.restore();
       }
 
-      // 3 Katmanlı Mor-Pembe Enerji Dalgaları
       for (let layer = 0; layer < 3; layer++) {
         ctx.beginPath();
         ctx.strokeStyle = layer === 0 ? "rgba(244, 63, 94, 0.9)" : (layer === 1 ? "rgba(217, 70, 239, 0.85)" : "rgba(168, 85, 247, 0.85)");
@@ -1071,7 +1235,6 @@ LIVE_ORB_HTML = """
       }
       ctx.shadowBlur = 0;
 
-      // Çekirdek (Simli Kristal Mor-Pembe Core)
       const core = ctx.createRadialGradient(cx, cy, 0, cx, cy, r * 0.85);
       core.addColorStop(0, "#ffffff");
       core.addColorStop(0.3, isUserTalking ? "#f472b6" : "#ec4899");
@@ -1100,18 +1263,13 @@ db_index_task = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global poll_task, db_index_task
-    
     await refresh_groq_models()
-
     if db is not None:
         db_index_task = asyncio.create_task(init_db_indexes())
-
     if BOT_TOKEN:
         poll_task = asyncio.create_task(telegram_long_poll_loop())
-        log_event("SYS", f"Katya Hands-Free VAD Mimarisinde ({FOUNDER_NAME} Anne) baslatildi!")
-
+        log_event("SYS", f"Katya Tam Otonom Core ({FOUNDER_NAME} Anne) baslatildi!")
     yield
-
     global polling_running
     polling_running = False
     if poll_task: poll_task.cancel()
@@ -1130,14 +1288,11 @@ async def home():
 async def live_app():
     return HTMLResponse(content=LIVE_ORB_HTML)
 
-# SES AKIŞI ENDPOINT'İ (MediaRecorder -> Whisper -> LLM -> Edge-TTS)
 @app.post("/api/voice_stream")
 async def voice_stream_endpoint(audio_file: UploadFile = File(...)):
     audio_data = await audio_file.read()
     user_transcript = await transcribe_audio_with_groq(audio_data)
-    
-    if not user_transcript:
-        user_transcript = "Ses anlasilamadi."
+    if not user_transcript: user_transcript = "Ses anlasilamadi."
 
     reply = await execute_mother_order(user_transcript)
     audio_base64 = await text_to_speech_base64(reply)
