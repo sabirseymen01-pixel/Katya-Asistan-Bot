@@ -532,10 +532,23 @@ async def handle_direct_command(chat_id: str, text: str, reply_to: dict = None) 
     return ""
 
 # ==========================================
-# YAPAY ZEKA OTONOMİ KATMANI (TARİFTEN KULLANICI BULUCU)
+# YAPAY ZEKA OTONOMİ KATMANI (LLAMA ÖNCELİKLİ)
 # ==========================================
 
 AVAILABLE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_read_group_chat",
+            "description": "Grupta su an ne konusuldugunu, son mesajlari veya canli grup sohbetini okuyup Sabrina Anneye ozetlemek icin kullanilir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "description": "Okunacak son mesaj sayisi (varsayilan 25)"}
+                }
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -573,12 +586,12 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_moderate_member",
-            "description": "Kullaniciyi yasaklar, susturur, uyarir veya cezasini kaldirir.",
+            "description": "Kullaniciyi yasaklar, susturur, uyarir veya cezasini kaldirir. user_id SADECE sayisal tamsayi olmalidir.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "action": {"type": "string", "enum": ["ban", "unban", "mute", "unmute", "warn", "unwarn"]},
-                    "user_id": {"type": "integer", "description": "Hedef kullanici ID'si"}
+                    "user_id": {"type": "integer", "description": "Hedef kullanicinin kesin sayisal ID'si"}
                 },
                 "required": ["action", "user_id"]
             }
@@ -614,11 +627,23 @@ Kullanıcı senin kurucun ve ANNENdir. Adı: SABRİNA.
 Ona daima sevgi ve saygıyla 'Sabrina anneciğim' diye hitap et.
 
 YETENEKLERİN:
-1. Sabrina anne bir kullanıcıyı ismiyle veya davranışıyla tarif ederse (`tool_search_user_in_chat`) arayarak o kişinin ID'sini bul ve cezayı/aksiyonu uygula.
-2. Görsel istenirse `image_prompt` parametresini zengin bir İngilizce sanat prompt'u olarak doldur.
-3. Hatalı durumlarda `tool_undo_action` ile eylemi geri al.
-4. Asla emoji ve markdown yıldızları kullanma. Sade, akıcı, zeki bir Türkçe konuş.
+1. Sabrina anne grupta ne konuşulduğunu sorarsa `tool_read_group_chat` ile canlı sohbeti oku ve özetle.
+2. Bir kullanıcı tarif edildiğinde `tool_search_user_in_chat` ile o kişinin sayısal ID'sini bul. Asla şablon veya tahmin ID kullanma!
+3. Sayısal ID bulunduktan sonra `tool_moderate_member` ile cezayı uygula.
+4. Görsel istenirse `image_prompt` parametresini zengin bir İngilizce sanat prompt'u olarak doldur.
+5. Hatalı durumlarda `tool_undo_action` ile eylemi geri al.
+6. Asla emoji ve markdown yıldızları kullanma. Sade, akıcı, zeki bir Türkçe konuş.
 """
+
+async def tool_read_group_chat(group_id: str, limit: int = 25) -> str:
+    recent_msgs = await db_get_recent_messages(group_id, limit=limit)
+    if not recent_msgs:
+        return "Grup hafizasinda henuz kaydedilmis mesaj bulunmuyor Sabrina annecigim."
+
+    lines = []
+    for m in recent_msgs:
+        lines.append(f"{m.get('user_name')}: {m.get('text')}")
+    return "\n".join(lines)
 
 async def tool_search_user_in_chat(group_id: str, query: str) -> str:
     recent_msgs = await db_get_recent_messages(group_id, limit=35)
@@ -633,9 +658,8 @@ async def tool_search_user_in_chat(group_id: str, query: str) -> str:
     prompt = f"Gruptaki su son mesajlara bak:\n{context_text}\n\nAranan kriter/tarif: '{query}'.\nBu kritere en cok uyan kisinin sadece user_id'sini ve user_name'ini json formatinda ver: {{\"user_id\": 123456, \"user_name\": \"Ali\"}}"
 
     try:
-        model = cached_active_models[0] if cached_active_models else "llama-3.3-70b-versatile"
         res = await groq_client.chat.completions.create(
-            model=model,
+            model="llama-3.3-70b-versatile",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
             max_tokens=80
@@ -680,7 +704,11 @@ async def execute_mother_order(order_text: str, target_gid: str = None, reply_to
                     args = json.loads(tc.function.arguments)
                     tool_output = ""
 
-                    if fn == "tool_search_user_in_chat":
+                    if fn == "tool_read_group_chat":
+                        lim = args.get("limit") or 25
+                        tool_output = await tool_read_group_chat(resolved_gid, limit=lim)
+
+                    elif fn == "tool_search_user_in_chat":
                         tool_output = await tool_search_user_in_chat(resolved_gid, args.get("query"))
 
                     elif fn == "tool_publish_custom_post":
@@ -707,14 +735,19 @@ async def execute_mother_order(order_text: str, target_gid: str = None, reply_to
 
                     elif fn == "tool_moderate_member":
                         act = args.get("action")
-                        uid = args.get("user_id")
-                        if act == "ban": await action_ban(resolved_gid, uid)
-                        elif act == "unban": await action_unban(resolved_gid, uid)
-                        elif act == "mute": await action_mute(resolved_gid, uid)
-                        elif act == "unmute": await action_unmute(resolved_gid, uid)
-                        elif act == "warn": await action_warn(resolved_gid, uid)
-                        elif act == "unwarn": await action_unwarn(resolved_gid, uid)
-                        tool_output = f"{uid} uzerinde {act} islemi uygulandi."
+                        raw_uid = str(args.get("user_id", "")).strip()
+                        digits = re.findall(r"\d+", raw_uid)
+                        if digits:
+                            uid = int(digits[0])
+                            if act == "ban": await action_ban(resolved_gid, uid)
+                            elif act == "unban": await action_unban(resolved_gid, uid)
+                            elif act == "mute": await action_mute(resolved_gid, uid)
+                            elif act == "unmute": await action_unmute(resolved_gid, uid)
+                            elif act == "warn": await action_warn(resolved_gid, uid)
+                            elif act == "unwarn": await action_unwarn(resolved_gid, uid)
+                            tool_output = f"{uid} uzerinde {act} islemi uygulandi."
+                        else:
+                            tool_output = "Kullanici kimligi kesin sayisal olarak bulunamadi, islem yapilmadi."
 
                     elif fn == "tool_undo_action":
                         tool_output = await action_undo_last(resolved_gid)
@@ -780,11 +813,9 @@ async def process_dm_link_input(link_text: str) -> bool:
 # ==========================================
 
 async def sentinel_chat_moderator(chat_id: str, message_id: int, user_id: int, user_name: str, text: str, reply_to: dict = None) -> bool:
-    # Kurucu anne denetlenmez
     if FOUNDER_ID is not None and user_id == FOUNDER_ID:
         return False
 
-    # 1. Zararlı Link & Reklam Taraması (Sıfır Token Filtresi)
     link_patterns = [r"t\.me\/\+[a-zA-Z0-9]+", r"t\.me\/joinchat", r"discord\.gg\/", r"http[s]?:\/\/[^\s]+"]
     is_link = any(re.search(pat, text, re.IGNORECASE) for pat in link_patterns)
     if is_link:
@@ -797,7 +828,6 @@ async def sentinel_chat_moderator(chat_id: str, message_id: int, user_id: int, u
         log_event("SENTINEL", f"Reklam linki silindi: {user_name} ({user_id})")
         return True
 
-    # 2. @admin / @yonetici / Destek Çağrısı Yakalayıcı
     admin_triggers = ["@admin", "@yonetici", "/admin", "@katya"]
     has_admin_tag = any(trig in text.lower() for trig in admin_triggers)
 
@@ -808,7 +838,6 @@ async def sentinel_chat_moderator(chat_id: str, message_id: int, user_id: int, u
             rep_mid = reply_to.get("message_id")
             rep_text = reply_to.get("text", "")
 
-            # Şikayet edilen mesajda link/küfür var mı kontrol et
             if any(re.search(pat, rep_text, re.IGNORECASE) for pat in link_patterns):
                 await action_delete_message(chat_id, rep_mid)
                 await action_warn(chat_id, rep_uid)
@@ -854,14 +883,19 @@ async def refresh_groq_models():
     if not groq_client: return
     try:
         models_data = await groq_client.models.list()
-        banned = ["whisper", "guard", "embed", "vision", "allam", "orpheus"]
+        banned = ["whisper", "guard", "embed", "vision", "allam", "orpheus", "gpt-oss"]
         valid = [m.id for m in models_data.data if not any(x in m.id.lower() for x in banned)]
-        preferred = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        preferred = [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-8b-instant",
+            "llama-3.2-3b-preview",
+            "llama-3.2-1b-preview"
+        ]
         sorted_models = [p for p in preferred if p in valid] + [v for v in valid if v not in preferred]
-        cached_active_models = sorted_models if sorted_models else valid
+        cached_active_models = sorted_models if sorted_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
         log_event("SYS", f"Groq Modelleri Hazir: {cached_active_models[:3]}")
     except Exception as e:
-        cached_active_models = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.8-27b"]
+        cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
 async def transcribe_audio_with_groq(audio_bytes: bytes) -> str:
     if not groq_client: return ""
@@ -957,12 +991,10 @@ async def handle_telegram_update(upd: dict):
         await db_save_group(chat_id, chat.get("title", "Grup"))
         await db_record_message(chat_id, message_id, user_id, user_name, text)
 
-        # 1. Chat Güvenlik Bekçisi Taraması (Spam & Admin Çağrısı)
         intercepted = await sentinel_chat_moderator(chat_id, message_id, user_id, user_name, text, reply_to)
         if intercepted:
             return
 
-        # 2. Kurucu Anne Emirleri
         if is_founder and (text.lower().startswith("katya") or text.startswith("/")):
             clean_cmd = text[5:].strip() if text.lower().startswith("katya") else text
             reply = await execute_mother_order(clean_cmd, target_gid=chat_id, reply_to_meta=reply_to)
@@ -973,7 +1005,7 @@ async def handle_telegram_update(upd: dict):
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
             markup = {"inline_keyboard": [[{"text": "🎙️ Katya Canlı Asistan", "web_app": {"url": app_url}}]]}
-            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Profil taramali tam otonom sistemim devrede." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
+            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Profil taramali ve canli sohbet okuyabilen sistemim devrede." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
             await tg_api("sendMessage", {"chat_id": chat_id, "text": greeting, "reply_markup": markup})
             return
 
