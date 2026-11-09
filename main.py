@@ -59,6 +59,12 @@ def log_event(level: str, message: str):
     timestamp = datetime.now().strftime("%H:%M:%S")
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
+def get_active_groq_model() -> str:
+    global cached_active_models
+    if cached_active_models:
+        return cached_active_models[0]
+    return "qwen/qwen3.8-27b"
+
 # ==========================================
 # MONGODB DEPOLAMA & KALICI HAFIZA KATMANI
 # ==========================================
@@ -543,7 +549,7 @@ async def handle_direct_command(chat_id: str, text: str, reply_to: dict = None) 
     return ""
 
 # ==========================================
-# YAPAY ZEKA OTONOMİ KATMANI (LLAMA ÖNCELİKLİ)
+# YAPAY ZEKA OTONOMİ KATMANI
 # ==========================================
 
 AVAILABLE_TOOLS = [
@@ -655,7 +661,7 @@ async def tool_find_and_moderate_user(group_id: str, query: str, action: str) ->
     target_name = None
     clean_query = query.strip().lower()
 
-    # 1. Aşama: Python ile doğrudan isim veya mesaj içi eşleşme
+    # 1. Aşama: Python ile doğrudan isim veya mesaj içi eşleşme (Sıfır Hata & Sıfır API Maliyeti)
     for m in reversed(recent_msgs):
         u_name = str(m.get("user_name", "")).lower()
         txt = str(m.get("text", "")).lower()
@@ -664,13 +670,18 @@ async def tool_find_and_moderate_user(group_id: str, query: str, action: str) ->
             target_name = m.get("user_name")
             break
 
-    # 2. Aşama: Doğrudan bulunamazsa Llama ile semantik arama
+    # 2. Aşama: Bulunamazsa aktif Groq modeliyle semantik arama
     if not target_uid:
         summary = [f"ID:{m.get('user_id')} | Isim:{m.get('user_name')} | Mesaj:{m.get('text')}" for m in recent_msgs[-30:]]
-        prompt = f"Gruptaki su mesaj listesine bak:\n" + "\n".join(summary) + f"\n\n'{query}' tarifine en uygun kisinin SADECE sayisal ID numarasini yaz. Baska hicbir kelime yazma."
+        prompt = (
+            "Gruptaki su mesaj listesine bak:\n"
+            + "\n".join(summary)
+            + f"\n\n'{query}' tarifine en uygun kisinin SADECE sayisal ID numarasini yaz. Baska hicbir aciklama veya metin yazma."
+        )
         try:
+            active_model = get_active_groq_model()
             res = await groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model=active_model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
                 max_tokens=30
@@ -681,7 +692,7 @@ async def tool_find_and_moderate_user(group_id: str, query: str, action: str) ->
                 target_uid = int(digits[0])
                 target_name = str(target_uid)
         except Exception as e:
-            log_event("ERR", f"Llama kullanici tespit hatasi: {e}")
+            log_event("ERR", f"Kullanici tespit hatasi: {e}")
 
     if not target_uid:
         return f"Mesaj gecmisinde '{query}' tarifine uyan bir kullanici bulunamadi Sabrina annecigim."
@@ -725,7 +736,7 @@ async def execute_mother_order(order_text: str, target_gid: str = None, reply_to
     quick_res = await handle_direct_command(resolved_gid, order_text, reply_to_meta)
     if quick_res: return quick_res
 
-    # 2. Kalıcı Diyalog Hafızası (MongoDB'den son konuşmaları çek)
+    # 2. Kalıcı Diyalog Hafızası (MongoDB'den son konuşmaları yükle)
     saved_history = await db_get_recent_dialogue(limit=6)
     messages = [
         {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\nHedef Grup: {resolved_gid}"}
@@ -946,16 +957,20 @@ async def refresh_groq_models():
         banned = ["whisper", "guard", "embed", "vision", "allam", "orpheus", "gpt-oss"]
         valid = [m.id for m in models_data.data if not any(x in m.id.lower() for x in banned)]
         preferred = [
-            "llama-3.3-70b-versatile",
+            "qwen/qwen3.8-27b",
             "llama-3.1-8b-instant",
-            "llama-3.2-3b-preview",
-            "llama-3.2-1b-preview"
+            "llama3-70b-8192",
+            "llama3-8b-8192",
+            "llama-3.3-70b-versatile"
         ]
         sorted_models = [p for p in preferred if p in valid] + [v for v in valid if v not in preferred]
-        cached_active_models = sorted_models if sorted_models else ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        cached_active_models = sorted_models if sorted_models else valid
+        if not cached_active_models:
+            cached_active_models = ["qwen/qwen3.8-27b"]
         log_event("SYS", f"Groq Modelleri Hazir: {cached_active_models[:3]}")
     except Exception as e:
-        cached_active_models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+        cached_active_models = ["qwen/qwen3.8-27b"]
+        log_event("WARN", f"Model listesi alinamadi, varsayilana donuldu: {e}")
 
 async def transcribe_audio_with_groq(audio_bytes: bytes) -> str:
     if not groq_client: return ""
