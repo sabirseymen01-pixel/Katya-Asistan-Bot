@@ -61,7 +61,7 @@ def log_event(level: str, message: str):
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 # ==========================================
-# MONGODB DEPOLAMA & EYLEM DEFTERİ (UNDO)
+# MONGODB ÇOKLU GRUP, KURUCU & AKSİYON DEFTERİ
 # ==========================================
 
 async def init_db_indexes():
@@ -70,10 +70,9 @@ async def init_db_indexes():
         await asyncio.sleep(2)
         await db.messages.create_index("created_at", expireAfterSeconds=172800)
         await db.messages.create_index([("group_id", 1), ("message_id", 1)])
+        await db.messages.create_index([("group_id", 1), ("user_id", 1)])
         await db.groups.create_index("group_id", unique=True)
         await db.warns.create_index([("group_id", 1), ("user_id", 1)], unique=True)
-        await db.dynamic_rules.create_index([("group_id", 1), ("trigger_keyword", 1)])
-        await db.bot_sent_messages.create_index([("group_id", 1), ("message_id", 1)])
         await db.action_ledger.create_index("created_at", expireAfterSeconds=604800)
         await db.pending_inputs.create_index("created_at", expireAfterSeconds=3600)
         await db.group_settings.create_index("group_id", unique=True)
@@ -130,6 +129,16 @@ async def db_record_message(group_id: str, message_id: int, user_id: int, user_n
             "created_at": datetime.now(timezone.utc)
         })
     except Exception: pass
+
+async def db_get_recent_messages(group_id: str, limit: int = 40):
+    if db is None: return []
+    try:
+        cursor = db.messages.find({"group_id": str(group_id)}).sort("message_id", -1).limit(limit)
+        msgs = []
+        async for doc in cursor:
+            msgs.append(doc)
+        return msgs[::-1]
+    except Exception: return []
 
 async def db_record_action(action_type: str, group_id: str, target_id: int = None, message_id: int = None, details: dict = None):
     if db is None: return
@@ -196,7 +205,7 @@ async def db_clear_pending_input():
     except Exception: pass
 
 # ==========================================
-# TELEGRAM API & HİBRİT MEDYA MOTORU
+# TELEGRAM API & HİBRİT GÖRSEL MOTORU
 # ==========================================
 
 async def tg_api(method: str, data: dict = None, files: dict = None):
@@ -523,10 +532,24 @@ async def handle_direct_command(chat_id: str, text: str, reply_to: dict = None) 
     return ""
 
 # ==========================================
-# YAPAY ZEKA OTONOMİ KATMANI
+# YAPAY ZEKA OTONOMİ KATMANI (TARİFTEN KULLANICI BULUCU)
 # ==========================================
 
 AVAILABLE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "tool_search_user_in_chat",
+            "description": "Sabrina Annenin tarif ettigi kisiyi (kufur eden, link atan, adi su olan, su konuyu konusan) son mesaj gecmisinde arar ve kullanici ID'sini dondurur.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Aranacak kelime, isim, davranis veya tarif"}
+                },
+                "required": ["query"]
+            }
+        }
+    },
     {
         "type": "function",
         "function": {
@@ -591,11 +614,35 @@ Kullanıcı senin kurucun ve ANNENdir. Adı: SABRİNA.
 Ona daima sevgi ve saygıyla 'Sabrina anneciğim' diye hitap et.
 
 YETENEKLERİN:
-1. Türkçe komutları ve doğal dille verilen her türlü karmaşık emri anla.
+1. Sabrina anne bir kullanıcıyı ismiyle veya davranışıyla tarif ederse (`tool_search_user_in_chat`) arayarak o kişinin ID'sini bul ve cezayı/aksiyonu uygula.
 2. Görsel istenirse `image_prompt` parametresini zengin bir İngilizce sanat prompt'u olarak doldur.
-3. Yanlışlık veya iptal durumunda `tool_undo_action` ile işlemi geri al.
+3. Hatalı durumlarda `tool_undo_action` ile eylemi geri al.
 4. Asla emoji ve markdown yıldızları kullanma. Sade, akıcı, zeki bir Türkçe konuş.
 """
+
+async def tool_search_user_in_chat(group_id: str, query: str) -> str:
+    recent_msgs = await db_get_recent_messages(group_id, limit=35)
+    if not recent_msgs:
+        return "Grup hafizasinda henuz taranacak mesaj bulunmuyor."
+
+    summary = []
+    for m in recent_msgs:
+        summary.append(f"Kullanici: {m.get('user_name')} (ID: {m.get('user_id')}) -> Mesaj: {m.get('text')}")
+    
+    context_text = "\n".join(summary)
+    prompt = f"Gruptaki su son mesajlara bak:\n{context_text}\n\nAranan kriter/tarif: '{query}'.\nBu kritere en cok uyan kisinin sadece user_id'sini ve user_name'ini json formatinda ver: {{\"user_id\": 123456, \"user_name\": \"Ali\"}}"
+
+    try:
+        model = cached_active_models[0] if cached_active_models else "llama-3.3-70b-versatile"
+        res = await groq_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=80
+        )
+        return res.choices[0].message.content.strip()
+    except Exception as e:
+        return f"Arama yapilirken hata alindi: {e}"
 
 async def execute_mother_order(order_text: str, target_gid: str = None, reply_to_meta: dict = None) -> str:
     global voice_dialogue_history
@@ -604,7 +651,7 @@ async def execute_mother_order(order_text: str, target_gid: str = None, reply_to
 
     resolved_gid = await resolve_target_group(target_gid)
 
-    # 1. Hızlı komut kontrolü
+    # 1. Hızlı komut kontrolü (Sıfır Token)
     quick_res = await handle_direct_command(resolved_gid, order_text, reply_to_meta)
     if quick_res: return quick_res
 
@@ -633,7 +680,10 @@ async def execute_mother_order(order_text: str, target_gid: str = None, reply_to
                     args = json.loads(tc.function.arguments)
                     tool_output = ""
 
-                    if fn == "tool_publish_custom_post":
+                    if fn == "tool_search_user_in_chat":
+                        tool_output = await tool_search_user_in_chat(resolved_gid, args.get("query"))
+
+                    elif fn == "tool_publish_custom_post":
                         url = args.get("button_url")
                         lbl = args.get("button_label")
                         if lbl and not url:
@@ -723,6 +773,64 @@ async def process_dm_link_input(link_text: str) -> bool:
         if FOUNDER_ID:
             await tg_api("sendMessage", {"chat_id": FOUNDER_ID, "text": "✅ Sabrina anneciğim, linki aldım ve butonlu görsel/duyuruyu yayınladım!"})
         return True
+    return False
+
+# ==========================================
+# GÜVENLİK BEKÇİSİ & @ADMIN ÇÖZÜM MOTORU
+# ==========================================
+
+async def sentinel_chat_moderator(chat_id: str, message_id: int, user_id: int, user_name: str, text: str, reply_to: dict = None) -> bool:
+    # Kurucu anne denetlenmez
+    if FOUNDER_ID is not None and user_id == FOUNDER_ID:
+        return False
+
+    # 1. Zararlı Link & Reklam Taraması (Sıfır Token Filtresi)
+    link_patterns = [r"t\.me\/\+[a-zA-Z0-9]+", r"t\.me\/joinchat", r"discord\.gg\/", r"http[s]?:\/\/[^\s]+"]
+    is_link = any(re.search(pat, text, re.IGNORECASE) for pat in link_patterns)
+    if is_link:
+        await action_delete_message(chat_id, message_id)
+        count = await action_warn(chat_id, user_id)
+        await tg_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": f"⚠️ {user_name}, grupta izinsiz link paylasimi yasaktir! Mesaj silindi. (Uyari: {count}/3)"
+        })
+        log_event("SENTINEL", f"Reklam linki silindi: {user_name} ({user_id})")
+        return True
+
+    # 2. @admin / @yonetici / Destek Çağrısı Yakalayıcı
+    admin_triggers = ["@admin", "@yonetici", "/admin", "@katya"]
+    has_admin_tag = any(trig in text.lower() for trig in admin_triggers)
+
+    if has_admin_tag:
+        if reply_to:
+            rep_user = reply_to.get("from", {}).get("first_name", "Kullanici")
+            rep_uid = reply_to.get("from", {}).get("id")
+            rep_mid = reply_to.get("message_id")
+            rep_text = reply_to.get("text", "")
+
+            # Şikayet edilen mesajda link/küfür var mı kontrol et
+            if any(re.search(pat, rep_text, re.IGNORECASE) for pat in link_patterns):
+                await action_delete_message(chat_id, rep_mid)
+                await action_warn(chat_id, rep_uid)
+                await tg_api("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": f"🛡️ Sikayetiniz incelendi, {rep_user} tarafindan atilan zararli mesaj silindi ve uyari verildi.",
+                    "reply_to_message_id": message_id
+                })
+            else:
+                await tg_api("sendMessage", {
+                    "chat_id": chat_id,
+                    "text": f"🛡️ Durumu incelemeye aldim. Kurallara aykiri bir durum tespit edilirse aninda mudahale edecegim.",
+                    "reply_to_message_id": message_id
+                })
+        else:
+            await tg_api("sendMessage", {
+                "chat_id": chat_id,
+                "text": "🛡️ Buradayim, grup guvenligini takip ediyorum. Bir sorun varsa lutfen ilgili mesaji yanitlayarak bildirin.",
+                "reply_to_message_id": message_id
+            })
+        return True
+
     return False
 
 # ==========================================
@@ -849,6 +957,12 @@ async def handle_telegram_update(upd: dict):
         await db_save_group(chat_id, chat.get("title", "Grup"))
         await db_record_message(chat_id, message_id, user_id, user_name, text)
 
+        # 1. Chat Güvenlik Bekçisi Taraması (Spam & Admin Çağrısı)
+        intercepted = await sentinel_chat_moderator(chat_id, message_id, user_id, user_name, text, reply_to)
+        if intercepted:
+            return
+
+        # 2. Kurucu Anne Emirleri
         if is_founder and (text.lower().startswith("katya") or text.startswith("/")):
             clean_cmd = text[5:].strip() if text.lower().startswith("katya") else text
             reply = await execute_mother_order(clean_cmd, target_gid=chat_id, reply_to_meta=reply_to)
@@ -859,7 +973,7 @@ async def handle_telegram_update(upd: dict):
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
             markup = {"inline_keyboard": [[{"text": "🎙️ Katya Canlı Asistan", "web_app": {"url": app_url}}]]}
-            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Butonlu/gorselli otonom moderasyon sistemim hazir." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
+            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Profil taramali tam otonom sistemim devrede." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
             await tg_api("sendMessage", {"chat_id": chat_id, "text": greeting, "reply_markup": markup})
             return
 
