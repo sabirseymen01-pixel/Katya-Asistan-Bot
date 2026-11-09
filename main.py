@@ -539,6 +539,21 @@ AVAILABLE_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "tool_find_and_moderate_user",
+            "description": "Sabrina Annenin tarif ettigi kisiyi (su mesaji atan, kufur eden, link atan, adi su olan) son mesaj gecmisinde arar, kesin sayisal ID'sini bularak aninda banlar, susturur veya uyarir.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Aranacak kelime, isim veya davranis tarifi"},
+                    "action": {"type": "string", "enum": ["mute", "ban", "warn", "unmute", "unban"], "description": "Uygulanacak ceza eylemi"}
+                },
+                "required": ["query", "action"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "tool_read_group_chat",
             "description": "Grupta su an ne konusuldugunu, son mesajlari veya canli grup sohbetini okuyup Sabrina Anneye ozetlemek icin kullanilir.",
             "parameters": {
@@ -546,20 +561,6 @@ AVAILABLE_TOOLS = [
                 "properties": {
                     "limit": {"type": "integer", "description": "Okunacak son mesaj sayisi (varsayilan 25)"}
                 }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "tool_search_user_in_chat",
-            "description": "Sabrina Annenin tarif ettigi kisiyi (kufur eden, link atan, adi su olan, su konuyu konusan) son mesaj gecmisinde arar ve kullanici ID'sini dondurur.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Aranacak kelime, isim, davranis veya tarif"}
-                },
-                "required": ["query"]
             }
         }
     },
@@ -586,7 +587,7 @@ AVAILABLE_TOOLS = [
         "type": "function",
         "function": {
             "name": "tool_moderate_member",
-            "description": "Kullaniciyi yasaklar, susturur, uyarir veya cezasini kaldirir. user_id SADECE sayisal tamsayi olmalidir.",
+            "description": "Kullaniciyi yasaklar, susturur, uyarir veya cezasini kaldirir. Sadece elinde kesin sayisal ID varsa kullan.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -627,13 +628,64 @@ Kullanıcı senin kurucun ve ANNENdir. Adı: SABRİNA.
 Ona daima sevgi ve saygıyla 'Sabrina anneciğim' diye hitap et.
 
 YETENEKLERİN:
-1. Sabrina anne grupta ne konuşulduğunu sorarsa `tool_read_group_chat` ile canlı sohbeti oku ve özetle.
-2. Bir kullanıcı tarif edildiğinde `tool_search_user_in_chat` ile o kişinin sayısal ID'sini bul. Asla şablon veya tahmin ID kullanma!
-3. Sayısal ID bulunduktan sonra `tool_moderate_member` ile cezayı uygula.
-4. Görsel istenirse `image_prompt` parametresini zengin bir İngilizce sanat prompt'u olarak doldur.
-5. Hatalı durumlarda `tool_undo_action` ile eylemi geri al.
-6. Asla emoji ve markdown yıldızları kullanma. Sade, akıcı, zeki bir Türkçe konuş.
+1. Sabrina anne grupta bir kullanıcıyı tarif edip susturmasını/banlamasını isterse DOĞRUDAN `tool_find_and_moderate_user` aracını çağır. Tek adımda arayıp cezayı uygular.
+2. Sabrina anne grupta ne konuşulduğunu sorarsa `tool_read_group_chat` ile canlı sohbeti oku ve özetle.
+3. Görsel istenirse `image_prompt` parametresini zengin bir İngilizce sanat prompt'u olarak doldur.
+4. Hatalı durumlarda `tool_undo_action` ile eylemi geri al.
+5. Asla emoji ve markdown yıldızları kullanma. Sade, akıcı, zeki bir Türkçe konuş.
 """
+
+async def tool_find_and_moderate_user(group_id: str, query: str, action: str) -> str:
+    recent_msgs = await db_get_recent_messages(group_id, limit=35)
+    if not recent_msgs:
+        return "Grup hafizasinda taranacak mesaj bulunmuyor Sabrina annecigim."
+
+    summary = []
+    for m in recent_msgs:
+        summary.append(f"Kullanici: {m.get('user_name')} | ID: {m.get('user_id')} | Mesaj: {m.get('text')}")
+    
+    context_text = "\n".join(summary)
+    prompt = f"""Gruptaki mesajlar:
+{context_text}
+
+Hedef kriter: '{query}'.
+Bu kritere uyan kisinin SADECE sayisal user_id'sini json dondur.
+Ornek cikti formati:
+{{"user_id": 12345678}}"""
+
+    try:
+        res = await groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=60
+        )
+        raw_resp = res.choices[0].message.content.strip()
+        digits = re.findall(r"\d{6,}", raw_resp)
+        if not digits:
+            return f"Mesajlarda '{query}' kriterine uyan bir kullanici ID'si tespit edilemedi."
+
+        target_uid = int(digits[0])
+        
+        if action == "mute":
+            await action_mute(group_id, target_uid)
+            return f"{target_uid} ID'li kullanici tespit edildi ve susturuldu Sabrina annecigim."
+        elif action == "ban":
+            await action_ban(group_id, target_uid)
+            return f"{target_uid} ID'li kullanici tespit edildi ve banlandi Sabrina annecigim."
+        elif action == "warn":
+            c = await action_warn(group_id, target_uid)
+            return f"{target_uid} ID'li kullanici tespit edildi ve uyarildi ({c}/3)."
+        elif action == "unmute":
+            await action_unmute(group_id, target_uid)
+            return f"{target_uid} ID'li kullanicinin susturmasi acildi."
+        elif action == "unban":
+            await action_unban(group_id, target_uid)
+            return f"{target_uid} ID'li kullanicinin yasagi kaldirildi."
+            
+        return f"{target_uid} tespit edildi fakat gecersiz aksiyon: {action}"
+    except Exception as e:
+        return f"Kullanici aranip islem yapilirken hata olustu: {e}"
 
 async def tool_read_group_chat(group_id: str, limit: int = 25) -> str:
     recent_msgs = await db_get_recent_messages(group_id, limit=limit)
@@ -644,29 +696,6 @@ async def tool_read_group_chat(group_id: str, limit: int = 25) -> str:
     for m in recent_msgs:
         lines.append(f"{m.get('user_name')}: {m.get('text')}")
     return "\n".join(lines)
-
-async def tool_search_user_in_chat(group_id: str, query: str) -> str:
-    recent_msgs = await db_get_recent_messages(group_id, limit=35)
-    if not recent_msgs:
-        return "Grup hafizasinda henuz taranacak mesaj bulunmuyor."
-
-    summary = []
-    for m in recent_msgs:
-        summary.append(f"Kullanici: {m.get('user_name')} (ID: {m.get('user_id')}) -> Mesaj: {m.get('text')}")
-    
-    context_text = "\n".join(summary)
-    prompt = f"Gruptaki su son mesajlara bak:\n{context_text}\n\nAranan kriter/tarif: '{query}'.\nBu kritere en cok uyan kisinin sadece user_id'sini ve user_name'ini json formatinda ver: {{\"user_id\": 123456, \"user_name\": \"Ali\"}}"
-
-    try:
-        res = await groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=80
-        )
-        return res.choices[0].message.content.strip()
-    except Exception as e:
-        return f"Arama yapilirken hata alindi: {e}"
 
 async def execute_mother_order(order_text: str, target_gid: str = None, reply_to_meta: dict = None) -> str:
     global voice_dialogue_history
@@ -704,12 +733,16 @@ async def execute_mother_order(order_text: str, target_gid: str = None, reply_to
                     args = json.loads(tc.function.arguments)
                     tool_output = ""
 
-                    if fn == "tool_read_group_chat":
+                    if fn == "tool_find_and_moderate_user":
+                        tool_output = await tool_find_and_moderate_user(
+                            group_id=resolved_gid,
+                            query=args.get("query"),
+                            action=args.get("action", "mute")
+                        )
+
+                    elif fn == "tool_read_group_chat":
                         lim = args.get("limit") or 25
                         tool_output = await tool_read_group_chat(resolved_gid, limit=lim)
-
-                    elif fn == "tool_search_user_in_chat":
-                        tool_output = await tool_search_user_in_chat(resolved_gid, args.get("query"))
 
                     elif fn == "tool_publish_custom_post":
                         url = args.get("button_url")
@@ -809,13 +842,14 @@ async def process_dm_link_input(link_text: str) -> bool:
     return False
 
 # ==========================================
-# GÜVENLİK BEKÇİSİ & @ADMIN ÇÖZÜM MOTORU
+# GÜVENLİK BEKÇİSİ, SAKİNLEŞTİRİCİ & @ADMIN ÇÖZÜM MOTORU
 # ==========================================
 
 async def sentinel_chat_moderator(chat_id: str, message_id: int, user_id: int, user_name: str, text: str, reply_to: dict = None) -> bool:
     if FOUNDER_ID is not None and user_id == FOUNDER_ID:
         return False
 
+    # 1. Zararlı Link & Reklam Taraması (Sıfır Token)
     link_patterns = [r"t\.me\/\+[a-zA-Z0-9]+", r"t\.me\/joinchat", r"discord\.gg\/", r"http[s]?:\/\/[^\s]+"]
     is_link = any(re.search(pat, text, re.IGNORECASE) for pat in link_patterns)
     if is_link:
@@ -828,6 +862,16 @@ async def sentinel_chat_moderator(chat_id: str, message_id: int, user_id: int, u
         log_event("SENTINEL", f"Reklam linki silindi: {user_name} ({user_id})")
         return True
 
+    # 2. Akıllı Arabulucu: Aşırı Bağırma / CAPS LOCK & Gerilim Filtresi
+    if len(text) > 15 and sum(1 for c in text if c.isupper()) / len(text) > 0.75:
+        await tg_api("sendMessage", {
+            "chat_id": chat_id,
+            "text": f"🕊️ {user_name}, lutfen buyuk harflerle bagirmayalim, sakin bir dille iletisim kuralim.",
+            "reply_to_message_id": message_id
+        })
+        return False
+
+    # 3. @admin / @yonetici / Destek Çağrısı Yakalayıcı
     admin_triggers = ["@admin", "@yonetici", "/admin", "@katya"]
     has_admin_tag = any(trig in text.lower() for trig in admin_triggers)
 
