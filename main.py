@@ -51,7 +51,6 @@ if MONGO_URI:
     except Exception as e:
         print(f"[ERR] Mongo istemci olusturma hatasi: {e}", flush=True)
 
-voice_dialogue_history = []
 scheduled_tasks = {}
 cached_active_models = []
 polling_running = False
@@ -61,7 +60,7 @@ def log_event(level: str, message: str):
     print(f"[{timestamp}] [{level}] {message}", flush=True)
 
 # ==========================================
-# MONGODB ÇOKLU GRUP, KURUCU & AKSİYON DEFTERİ
+# MONGODB DEPOLAMA & KALICI HAFIZA KATMANI
 # ==========================================
 
 async def init_db_indexes():
@@ -74,6 +73,7 @@ async def init_db_indexes():
         await db.groups.create_index("group_id", unique=True)
         await db.warns.create_index([("group_id", 1), ("user_id", 1)], unique=True)
         await db.action_ledger.create_index("created_at", expireAfterSeconds=604800)
+        await db.voice_history.create_index("created_at", expireAfterSeconds=604800)
         await db.pending_inputs.create_index("created_at", expireAfterSeconds=3600)
         await db.group_settings.create_index("group_id", unique=True)
         await db.custom_skills.create_index("skill_name", unique=True)
@@ -130,7 +130,7 @@ async def db_record_message(group_id: str, message_id: int, user_id: int, user_n
         })
     except Exception: pass
 
-async def db_get_recent_messages(group_id: str, limit: int = 40):
+async def db_get_recent_messages(group_id: str, limit: int = 50):
     if db is None: return []
     try:
         cursor = db.messages.find({"group_id": str(group_id)}).sort("message_id", -1).limit(limit)
@@ -153,17 +153,25 @@ async def db_record_action(action_type: str, group_id: str, target_id: int = Non
         })
     except Exception: pass
 
-async def db_get_last_action(group_id: str = None):
-    if db is None: return None
-    try:
-        query = {"group_id": str(group_id)} if group_id else {}
-        return await db.action_ledger.find_one(query, sort=[("created_at", -1)])
-    except Exception: return None
-
-async def db_delete_action_record(doc_id):
+async def db_save_dialogue(role: str, content: str):
     if db is None: return
-    try: await db.action_ledger.delete_one({"_id": doc_id})
+    try:
+        await db.voice_history.insert_one({
+            "role": role,
+            "content": content,
+            "created_at": datetime.now(timezone.utc)
+        })
     except Exception: pass
+
+async def db_get_recent_dialogue(limit: int = 8):
+    if db is None: return []
+    try:
+        cursor = db.voice_history.find({}).sort("_id", -1).limit(limit)
+        items = []
+        async for doc in cursor:
+            items.append({"role": doc.get("role"), "content": doc.get("content")})
+        return items[::-1]
+    except Exception: return []
 
 async def db_get_group_settings(group_id: str):
     if db is None: return {}
@@ -308,30 +316,33 @@ async def action_delete_message(chat_id: str, message_id: int) -> bool:
     return bool(res and res.get("ok"))
 
 async def action_undo_last(chat_id: str) -> str:
-    last = await db_get_last_action(chat_id)
-    if not last: return "Geri alinacak yakin bir islem bulunamadi Sabrina annecigim."
+    if db is None:
+        return "Veritabani baglantisi olmadigi icin islem geri alinamiyor Sabrina annecigim."
 
-    act_type = last["action_type"]
-    gid = last["group_id"]
+    last = await db.action_ledger.find_one({"group_id": str(chat_id)}, sort=[("_id", -1)])
+    if not last:
+        return "Geri alinacak yakin bir islem kaydi bulunamadi Sabrina annecigim."
+
+    act_type = last.get("action_type")
     target_id = last.get("target_id")
     msg_id = last.get("message_id")
+    gid = last.get("group_id")
 
-    if act_type == "ban":
+    msg = "Islem geri alindi."
+    if act_type == "ban" and target_id:
         await action_unban(gid, target_id)
-        msg = f"{target_id} kimlikli uyenin yasaklamasi kaldirildi."
-    elif act_type == "mute":
+        msg = f"{target_id} kimlikli kullanicinin bani kaldirildi."
+    elif act_type == "mute" and target_id:
         await action_unmute(gid, target_id)
-        msg = f"{target_id} kimlikli uyenin susturmasi acildi."
-    elif act_type == "warn":
+        msg = f"{target_id} kimlikli kullanicinin susturmasi acildi."
+    elif act_type == "warn" and target_id:
         await action_unwarn(gid, target_id)
-        msg = f"{target_id} kimlikli uyenin uyarilari sifirlandi."
+        msg = f"{target_id} kimlikli kullanicinin uyarisi silindi."
     elif act_type in ["announcement", "post"] and msg_id:
         await action_delete_message(gid, msg_id)
         msg = "Son paylasilan duyuru silindi."
-    else:
-        msg = "Islem geri alindi."
 
-    await db_delete_action_record(last["_id"])
+    await db.action_ledger.delete_one({"_id": last["_id"]})
     return f"Geri alindi Sabrina annecigim: {msg}"
 
 async def action_publish_post(
@@ -636,56 +647,63 @@ YETENEKLERİN:
 """
 
 async def tool_find_and_moderate_user(group_id: str, query: str, action: str) -> str:
-    recent_msgs = await db_get_recent_messages(group_id, limit=35)
+    recent_msgs = await db_get_recent_messages(group_id, limit=50)
     if not recent_msgs:
         return "Grup hafizasinda taranacak mesaj bulunmuyor Sabrina annecigim."
 
-    summary = []
-    for m in recent_msgs:
-        summary.append(f"Kullanici: {m.get('user_name')} | ID: {m.get('user_id')} | Mesaj: {m.get('text')}")
-    
-    context_text = "\n".join(summary)
-    prompt = f"""Gruptaki mesajlar:
-{context_text}
+    target_uid = None
+    target_name = None
+    clean_query = query.strip().lower()
 
-Hedef kriter: '{query}'.
-Bu kritere uyan kisinin SADECE sayisal user_id'sini json dondur.
-Ornek cikti formati:
-{{"user_id": 12345678}}"""
+    # 1. Aşama: Python ile doğrudan isim veya mesaj içi eşleşme
+    for m in reversed(recent_msgs):
+        u_name = str(m.get("user_name", "")).lower()
+        txt = str(m.get("text", "")).lower()
+        if clean_query in u_name or clean_query in txt:
+            target_uid = m.get("user_id")
+            target_name = m.get("user_name")
+            break
 
-    try:
-        res = await groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1,
-            max_tokens=60
-        )
-        raw_resp = res.choices[0].message.content.strip()
-        digits = re.findall(r"\d{6,}", raw_resp)
-        if not digits:
-            return f"Mesajlarda '{query}' kriterine uyan bir kullanici ID'si tespit edilemedi."
+    # 2. Aşama: Doğrudan bulunamazsa Llama ile semantik arama
+    if not target_uid:
+        summary = [f"ID:{m.get('user_id')} | Isim:{m.get('user_name')} | Mesaj:{m.get('text')}" for m in recent_msgs[-30:]]
+        prompt = f"Gruptaki su mesaj listesine bak:\n" + "\n".join(summary) + f"\n\n'{query}' tarifine en uygun kisinin SADECE sayisal ID numarasini yaz. Baska hicbir kelime yazma."
+        try:
+            res = await groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=30
+            )
+            raw = res.choices[0].message.content.strip()
+            digits = re.findall(r"\b\d{5,12}\b", raw)
+            if digits:
+                target_uid = int(digits[0])
+                target_name = str(target_uid)
+        except Exception as e:
+            log_event("ERR", f"Llama kullanici tespit hatasi: {e}")
 
-        target_uid = int(digits[0])
-        
-        if action == "mute":
-            await action_mute(group_id, target_uid)
-            return f"{target_uid} ID'li kullanici tespit edildi ve susturuldu Sabrina annecigim."
-        elif action == "ban":
-            await action_ban(group_id, target_uid)
-            return f"{target_uid} ID'li kullanici tespit edildi ve banlandi Sabrina annecigim."
-        elif action == "warn":
-            c = await action_warn(group_id, target_uid)
-            return f"{target_uid} ID'li kullanici tespit edildi ve uyarildi ({c}/3)."
-        elif action == "unmute":
-            await action_unmute(group_id, target_uid)
-            return f"{target_uid} ID'li kullanicinin susturmasi acildi."
-        elif action == "unban":
-            await action_unban(group_id, target_uid)
-            return f"{target_uid} ID'li kullanicinin yasagi kaldirildi."
-            
-        return f"{target_uid} tespit edildi fakat gecersiz aksiyon: {action}"
-    except Exception as e:
-        return f"Kullanici aranip islem yapilirken hata olustu: {e}"
+    if not target_uid:
+        return f"Mesaj gecmisinde '{query}' tarifine uyan bir kullanici bulunamadi Sabrina annecigim."
+
+    # 3. Aşama: Eylemi doğrudan infaz et
+    if action == "mute":
+        ok = await action_mute(group_id, target_uid)
+        return f"{target_name} ({target_uid}) basariyla susturuldu." if ok else "Susturma yetkim yetersiz annecigim."
+    elif action == "ban":
+        ok = await action_ban(group_id, target_uid)
+        return f"{target_name} ({target_uid}) basariyla gruptan banlandi." if ok else "Banlama yetkim yetersiz annecigim."
+    elif action == "warn":
+        c = await action_warn(group_id, target_uid)
+        return f"{target_name} uyarildi (Toplam: {c}/3)."
+    elif action == "unmute":
+        ok = await action_unmute(group_id, target_uid)
+        return f"{target_name} kullanicisinin susturmasi acildi." if ok else "Susturma kaldirilamadi."
+    elif action == "unban":
+        ok = await action_unban(group_id, target_uid)
+        return f"{target_name} kullanicisinin bani kaldirildi." if ok else "Ban kaldirilamadi."
+
+    return f"Gecersiz islem: {action}"
 
 async def tool_read_group_chat(group_id: str, limit: int = 25) -> str:
     recent_msgs = await db_get_recent_messages(group_id, limit=limit)
@@ -698,7 +716,6 @@ async def tool_read_group_chat(group_id: str, limit: int = 25) -> str:
     return "\n".join(lines)
 
 async def execute_mother_order(order_text: str, target_gid: str = None, reply_to_meta: dict = None) -> str:
-    global voice_dialogue_history
     if not groq_client: return "Yapay zeka beynim bagli degil Sabrina annecigim."
     if not cached_active_models: await refresh_groq_models()
 
@@ -708,11 +725,13 @@ async def execute_mother_order(order_text: str, target_gid: str = None, reply_to
     quick_res = await handle_direct_command(resolved_gid, order_text, reply_to_meta)
     if quick_res: return quick_res
 
-    # 2. LLM Otonomi
+    # 2. Kalıcı Diyalog Hafızası (MongoDB'den son konuşmaları çek)
+    saved_history = await db_get_recent_dialogue(limit=6)
     messages = [
         {"role": "system", "content": f"{KATYA_SYSTEM_PROMPT}\nHedef Grup: {resolved_gid}"}
     ]
-    for hist in voice_dialogue_history[-4:]: messages.append(hist)
+    for hist in saved_history:
+        messages.append(hist)
     messages.append({"role": "user", "content": order_text})
 
     for model_name in cached_active_models:
@@ -799,13 +818,13 @@ async def execute_mother_order(order_text: str, target_gid: str = None, reply_to
                     max_tokens=200
                 )
                 ans = strip_emojis_and_markdown(final.choices[0].message.content.strip())
-                voice_dialogue_history.append({"role": "user", "content": order_text})
-                voice_dialogue_history.append({"role": "assistant", "content": ans})
+                await db_save_dialogue("user", order_text)
+                await db_save_dialogue("assistant", ans)
                 return ans
 
             ans = strip_emojis_and_markdown(msg.content.strip() if msg.content else "Seni dinliyorum Sabrina annecigim.")
-            voice_dialogue_history.append({"role": "user", "content": order_text})
-            voice_dialogue_history.append({"role": "assistant", "content": ans})
+            await db_save_dialogue("user", order_text)
+            await db_save_dialogue("assistant", ans)
             return ans
         except Exception as e:
             log_event("WARN", f"Model ({model_name}) hata aldi: {e}")
@@ -849,7 +868,6 @@ async def sentinel_chat_moderator(chat_id: str, message_id: int, user_id: int, u
     if FOUNDER_ID is not None and user_id == FOUNDER_ID:
         return False
 
-    # 1. Zararlı Link & Reklam Taraması (Sıfır Token)
     link_patterns = [r"t\.me\/\+[a-zA-Z0-9]+", r"t\.me\/joinchat", r"discord\.gg\/", r"http[s]?:\/\/[^\s]+"]
     is_link = any(re.search(pat, text, re.IGNORECASE) for pat in link_patterns)
     if is_link:
@@ -862,7 +880,6 @@ async def sentinel_chat_moderator(chat_id: str, message_id: int, user_id: int, u
         log_event("SENTINEL", f"Reklam linki silindi: {user_name} ({user_id})")
         return True
 
-    # 2. Akıllı Arabulucu: Aşırı Bağırma / CAPS LOCK & Gerilim Filtresi
     if len(text) > 15 and sum(1 for c in text if c.isupper()) / len(text) > 0.75:
         await tg_api("sendMessage", {
             "chat_id": chat_id,
@@ -871,7 +888,6 @@ async def sentinel_chat_moderator(chat_id: str, message_id: int, user_id: int, u
         })
         return False
 
-    # 3. @admin / @yonetici / Destek Çağrısı Yakalayıcı
     admin_triggers = ["@admin", "@yonetici", "/admin", "@katya"]
     has_admin_tag = any(trig in text.lower() for trig in admin_triggers)
 
@@ -1049,7 +1065,7 @@ async def handle_telegram_update(upd: dict):
         if text == "/start":
             app_url = "https://katya-asistan-bot.onrender.com/live"
             markup = {"inline_keyboard": [[{"text": "🎙️ Katya Canlı Asistan", "web_app": {"url": app_url}}]]}
-            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Profil taramali ve canli sohbet okuyabilen sistemim devrede." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
+            greeting = f"Merhaba {FOUNDER_NAME} annecigim! Profil taramali, kalici hafizali ve canli sohbet okuyabilen sistemim devrede." if is_founder else "Merhaba! Ben grup moderasyon asistani Katya."
             await tg_api("sendMessage", {"chat_id": chat_id, "text": greeting, "reply_markup": markup})
             return
 
